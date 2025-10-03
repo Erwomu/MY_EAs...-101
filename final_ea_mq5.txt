@@ -1,0 +1,781 @@
+//+------------------------------------------------------------------+
+//|                                              L'ACTION DE PRIX.mq5 |
+//|                                  Copyright 2025, MetaQuotes Ltd. |
+//|                                             https://www.mql5.com |
+//+------------------------------------------------------------------+
+#property copyright "Copyright 2025, MetaQuotes Ltd."
+#property link      "https://www.mql5.com"
+#property version   "2.00"
+#property description "Multi-Symbol Price Action Trading System"
+#property description "Enhanced with Dynamic Risk Management"
+
+//+------------------------------------------------------------------+
+//| Include Directives                                               |
+//+------------------------------------------------------------------+
+#include <Trade\Trade.mqh>
+#include <Trade\SymbolInfo.mqh>
+#include <Trade\PositionInfo.mqh>
+#include <PriceAction.mqh>
+
+//+------------------------------------------------------------------+
+//| Input Parameters                                                 |
+//+------------------------------------------------------------------+
+// Point of Interest Selection
+enum POI_TYPE
+{
+    PIVOT_POINT,    // Pivot Point
+    VWAP            // Volume Weighted Average Price
+};
+
+sinput string            SEP1                = "=== Focus Settings ===";
+input POI_TYPE           PointOfInterest    = PIVOT_POINT;
+input ENUM_TIMEFRAMES    PivotTimeframe     = PERIOD_D1;
+input ENUM_TIMEFRAMES    PatternTimeframe   = PERIOD_M5;
+
+sinput string            SEP2                = "=== Trading Hours ===";
+input bool               UseTradingHours    = true;
+input int                StartHour          = 10;
+input int                StartMinute        = 30;
+input int                EndHour            = 16;
+input int                EndMinute          = 0;
+
+sinput string            SEP3                = "=== Risk Management ===";
+input double             RiskPercent        = 0.5;           // Risk per trade (%)
+input double             MinStopLoss        = 20;            // Minimum SL in points
+input double             MaxStopLoss        = 85;            // Maximum SL in points
+input double             RiskRewardRatio    = 2.0;           // Risk:Reward ratio
+input int                MaxPositionsPerSymbol = 1;          // Max positions per symbol
+input int                MaxTotalPositions  = 3;             // Max total positions
+
+sinput string            SEP4                = "=== Momentum Settings ===";
+input ENUM_TIMEFRAMES    MomentumTimeframe  = PERIOD_H1;
+input int                MomentumPeriod     = 14;
+
+sinput string            SEP5                = "=== Trading Filters ===";
+input bool               UseNewsFilter      = true;
+input bool               UseSpreadFilter    = true;
+input bool               RequireEngulfing   = true;          // Require engulfing pattern
+input bool               RequirePinBar      = false;         // Require pin bar pattern
+
+//+------------------------------------------------------------------+
+//| Symbol Configuration Structure                                    |
+//+------------------------------------------------------------------+
+struct SymbolConfig
+{
+    string  symbol;
+    double  multiplier;     // Pip value multiplier
+    double  maxSpread;      // Maximum acceptable spread
+    double  stopLoss;       // Fixed stop loss for symbol
+    bool    isActive;       // Symbol trading enabled
+    
+    // Trading state
+    double  lotSize;
+    double  currentSL;
+    double  currentTP;
+    double  pivotPoint;
+    double  vwap;
+    double  keyLevel;
+    double  fibLevel;
+    bool    bullishSignal;
+    bool    sellSignal;
+    bool    hasPosition;
+    datetime lastTradeTime;
+    int     consecutiveLosses;
+};
+
+//+------------------------------------------------------------------+
+//| Global Variables                                                  |
+//+------------------------------------------------------------------+
+SymbolConfig    g_symbols[];
+int             g_symbolCount = 0;
+CTrade          g_trade;
+CSymbolInfo     g_symbolInfo;
+CPositionInfo   g_positionInfo;
+
+// Pattern detection variables
+bool            g_bullishEngulfing[];
+bool            g_bearishEngulfing[];
+int             g_pinBarSignal[];
+
+// Trading state
+bool            g_tradingEnabled = true;
+datetime        g_lastNewsCheck = 0;
+int             g_totalPositions = 0;
+
+//+------------------------------------------------------------------+
+//| Expert Initialization Function                                    |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+    // Initialize PriceAction library
+    if(!InitializePriceAction())
+    {
+        Print("Error: Failed to initialize PriceAction library");
+        return INIT_FAILED;
+    }
+    
+    // Configure symbols for trading
+    ConfigureSymbols();
+    
+    // Initialize pattern arrays
+    ArrayResize(g_bullishEngulfing, g_symbolCount);
+    ArrayResize(g_bearishEngulfing, g_symbolCount);
+    ArrayResize(g_pinBarSignal, g_symbolCount);
+    
+    // Initialize symbols in PriceAction library
+    for(int i = 0; i < g_symbolCount; i++)
+    {
+        if(!InitializeSymbol(g_symbols[i].symbol, g_symbols[i].multiplier, g_symbols[i].maxSpread))
+        {
+            PrintFormat("Warning: Failed to initialize %s in PriceAction library", g_symbols[i].symbol);
+            g_symbols[i].isActive = false;
+        }
+        else
+        {
+            g_symbols[i].isActive = true;
+            PrintFormat("Symbol %s initialized successfully", g_symbols[i].symbol);
+        }
+    }
+    
+    // Set up trading object
+    g_trade.SetExpertMagicNumber(123456);
+    g_trade.SetDeviationInPoints(10);
+    g_trade.SetTypeFilling(ORDER_FILLING_IOC);
+    g_trade.SetTypeFillingBySymbol(_Symbol);
+    
+    // Set timer for periodic updates
+    EventSetTimer(30);
+    
+    Print("=========================================");
+    Print("L'ACTION DE PRIX EA v2.0 Initialized");
+    Print("Active Symbols: ", CountActiveSymbols());
+    Print("Risk Per Trade: ", RiskPercent, "%");
+    Print("=========================================");
+    
+    return INIT_SUCCEEDED;
+}
+
+//+------------------------------------------------------------------+
+//| Expert Deinitialization Function                                  |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+    // Clean up PriceAction library
+    DeinitializePriceAction();
+    
+    // Kill timer
+    EventKillTimer();
+    
+    // Log deinitialization reason
+    string reasonText = GetDeinitReasonText(reason);
+    PrintFormat("EA Deinitialized: %s", reasonText);
+    
+    // Clean up chart objects
+    ObjectsDeleteAll(0, 0, -1);
+    ChartRedraw();
+}
+
+//+------------------------------------------------------------------+
+//| Timer Event Function                                              |
+//+------------------------------------------------------------------+
+void OnTimer()
+{
+    // Check news impact
+    if(UseNewsFilter)
+    {
+        CheckNewsImpact();
+    }
+    
+    // Update each symbol's analysis
+    for(int i = 0; i < g_symbolCount; i++)
+    {
+        if(!g_symbols[i].isActive)
+            continue;
+            
+        string symbol = g_symbols[i].symbol;
+        
+        // Process symbol through PriceAction library
+        ProcessSymbol(symbol);
+        
+        // Calculate key levels
+        CalculateKeyLevels(i);
+        
+        // Draw Fibonacci retracement
+        DrawFibonacci(symbol);
+        
+        // Find matching Fibonacci level
+        g_symbols[i].fibLevel = FindMatchingFibLevel(i);
+        
+        // Draw support/resistance zones
+        if(g_symbols[i].fibLevel > 0 && g_symbols[i].keyLevel > 0)
+        {
+            DrawZone(g_symbols[i].fibLevel, g_symbols[i].keyLevel, symbol);
+        }
+        
+        // Calculate lot size
+        g_symbols[i].lotSize = CalculateLotSize(symbol, GetSymbolIndex(symbol));
+        
+        // Log symbol status
+        LogDebug(GetSymbolStatus(symbol));
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Tick Event Function                                               |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+    // Update total positions count
+    g_totalPositions = GetActivePositionsCount();
+    
+    // Check if trading is allowed globally
+    if(!g_tradingEnabled || g_totalPositions >= MaxTotalPositions)
+        return;
+        
+    // Process each symbol
+    for(int i = 0; i < g_symbolCount; i++)
+    {
+        if(!g_symbols[i].isActive)
+            continue;
+            
+        string symbol = g_symbols[i].symbol;
+        
+        // Skip if symbol already has position
+        if(GetActivePositionsCount(symbol) >= MaxPositionsPerSymbol)
+        {
+            g_symbols[i].hasPosition = true;
+            continue;
+        }
+        else
+        {
+            g_symbols[i].hasPosition = false;
+        }
+        
+        // Check trading conditions
+        if(!CheckTradingConditions(i))
+            continue;
+            
+        // Detect patterns
+        DetectPatterns(i);
+        
+        // Check price position
+        double keyLevel = (g_symbols[i].fibLevel + g_symbols[i].keyLevel) / 2;
+        if(keyLevel > 0)
+        {
+            PricePosition(keyLevel, symbol);
+        }
+        
+        // Generate trading signals
+        GenerateSignals(i);
+        
+        // Execute trades if signals are valid
+        if(g_symbols[i].bullishSignal && ValidateBuySignal(i))
+        {
+            ExecuteBuyTrade(i);
+        }
+        else if(g_symbols[i].sellSignal && ValidateSellSignal(i))
+        {
+            ExecuteSellTrade(i);
+        }
+    }
+    
+    // Manage existing positions
+    ManageOpenPositions();
+}
+
+//+------------------------------------------------------------------+
+//| Configure Trading Symbols                                        |
+//+------------------------------------------------------------------+
+void ConfigureSymbols()
+{
+    // Define symbols to trade
+    string symbols[] = {"EURUSD", "GBPUSD", "USDJPY", "GOLD", "BTCUSD", "USDCHF"};
+    double multipliers[] = {10000, 10000, 100, 10, 1, 10000};
+    double maxSpreads[] = {0.00020, 0.00025, 0.030, 0.50, 5.0, 0.00020};
+    double stopLosses[] = {0.00250, 0.00350, 0.35000, 6.5000, 180.00, 0.00250};
+    
+    g_symbolCount = ArraySize(symbols);
+    ArrayResize(g_symbols, g_symbolCount);
+    
+    for(int i = 0; i < g_symbolCount; i++)
+    {
+        g_symbols[i].symbol = symbols[i];
+        g_symbols[i].multiplier = multipliers[i];
+        g_symbols[i].maxSpread = maxSpreads[i];
+        g_symbols[i].stopLoss = stopLosses[i];
+        g_symbols[i].isActive = false;
+        g_symbols[i].lotSize = 0.01;
+        g_symbols[i].currentSL = 0.0;
+        g_symbols[i].currentTP = 0.0;
+        g_symbols[i].pivotPoint = 0.0;
+        g_symbols[i].vwap = 0.0;
+        g_symbols[i].keyLevel = 0.0;
+        g_symbols[i].fibLevel = 0.0;
+        g_symbols[i].bullishSignal = false;
+        g_symbols[i].sellSignal = false;
+        g_symbols[i].hasPosition = false;
+        g_symbols[i].lastTradeTime = 0;
+        g_symbols[i].consecutiveLosses = 0;
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Calculate Key Levels (Pivot/VWAP)                                |
+//+------------------------------------------------------------------+
+void CalculateKeyLevels(int index)
+{
+    string symbol = g_symbols[index].symbol;
+    
+    double high = iHigh(symbol, PivotTimeframe, 1);
+    double low = iLow(symbol, PivotTimeframe, 1);
+    double close = iClose(symbol, PivotTimeframe, 1);
+    double open = iOpen(symbol, PivotTimeframe, 1);
+    
+    if(high <= 0 || low <= 0 || close <= 0)
+    {
+        LogDebug("Failed to retrieve price data for " + symbol);
+        return;
+    }
+    
+    // Calculate Pivot Point
+    g_symbols[index].pivotPoint = (high + low + close) / 3;
+    
+    // Calculate VWAP
+    g_symbols[index].vwap = (high + low + close + open) / 4;
+    
+    // Set key level based on selection
+    if(PointOfInterest == PIVOT_POINT)
+        g_symbols[index].keyLevel = g_symbols[index].pivotPoint;
+    else
+        g_symbols[index].keyLevel = g_symbols[index].vwap;
+        
+    // Draw horizontal line for key level
+    string lineName = "KeyLevel_" + symbol;
+    ObjectDelete(0, lineName);
+    
+    if(g_symbols[index].keyLevel > 0)
+    {
+        ObjectCreate(0, lineName, OBJ_HLINE, 0, 0, g_symbols[index].keyLevel);
+        ObjectSetInteger(0, lineName, OBJPROP_COLOR, clrGold);
+        ObjectSetInteger(0, lineName, OBJPROP_STYLE, STYLE_DASH);
+        ObjectSetInteger(0, lineName, OBJPROP_WIDTH, 2);
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Find Matching Fibonacci Level                                    |
+//+------------------------------------------------------------------+
+double FindMatchingFibLevel(int index)
+{
+    string symbol = g_symbols[index].symbol;
+    int symIndex = GetSymbolIndex(symbol);
+    
+    if(symIndex < 0)
+        return 0.0;
+        
+    // Get Fibonacci data from PriceAction library
+    double highPrice = g_symbolData[symIndex].highestPrice;
+    double lowPrice = g_symbolData[symIndex].lowestPrice;
+    bool isBullish = g_symbolData[symIndex].isBullishFib;
+    bool isBearish = g_symbolData[symIndex].isBearishFib;
+    
+    if(highPrice <= 0 || lowPrice <= 0 || (!isBullish && !isBearish))
+        return 0.0;
+        
+    double fibLevels[4];
+    double keyLevel = g_symbols[index].keyLevel;
+    
+    // Calculate Fibonacci levels
+    if(isBullish)
+    {
+        fibLevels[0] = lowPrice + (highPrice - lowPrice) * 0.236;
+        fibLevels[1] = lowPrice + (highPrice - lowPrice) * 0.382;
+        fibLevels[2] = lowPrice + (highPrice - lowPrice) * 0.500;
+        fibLevels[3] = lowPrice + (highPrice - lowPrice) * 0.618;
+    }
+    else
+    {
+        fibLevels[0] = highPrice - (highPrice - lowPrice) * 0.236;
+        fibLevels[1] = highPrice - (highPrice - lowPrice) * 0.382;
+        fibLevels[2] = highPrice - (highPrice - lowPrice) * 0.500;
+        fibLevels[3] = highPrice - (highPrice - lowPrice) * 0.618;
+    }
+    
+    // Find closest Fibonacci level to key level
+    double minDiff = DBL_MAX;
+    double closestLevel = 0.0;
+    double tolerance = GetTolerance(symbol);
+    
+    for(int i = 0; i < 4; i++)
+    {
+        double diff = MathAbs(fibLevels[i] - keyLevel);
+        if(diff < minDiff && diff <= tolerance)
+        {
+            minDiff = diff;
+            closestLevel = fibLevels[i];
+        }
+    }
+    
+    return closestLevel;
+}
+
+//+------------------------------------------------------------------+
+//| Get Tolerance for Symbol                                         |
+//+------------------------------------------------------------------+
+double GetTolerance(string symbol)
+{
+    if(symbol == "BTCUSD") return 200.0;
+    if(symbol == "GOLD") return 2.5;
+    if(symbol == "USDJPY") return 0.20;
+    return 0.0015; // Default for forex pairs
+}
+
+//+------------------------------------------------------------------+
+//| Detect Candlestick Patterns                                      |
+//+------------------------------------------------------------------+
+void DetectPatterns(int index)
+{
+    string symbol = g_symbols[index].symbol;
+    
+    // Reset pattern flags
+    g_bullishEngulfing[index] = false;
+    g_bearishEngulfing[index] = false;
+    g_pinBarSignal[index] = 0;
+    
+    // Check engulfing patterns
+    double open1 = iOpen(symbol, PatternTimeframe, 1);
+    double close1 = iClose(symbol, PatternTimeframe, 1);
+    double open2 = iOpen(symbol, PatternTimeframe, 2);
+    double close2 = iClose(symbol, PatternTimeframe, 2);
+    
+    if(open1 > 0 && close1 > 0 && open2 > 0 && close2 > 0)
+    {
+        // Bullish engulfing
+        if(close2 < open2 && close1 > open1 && 
+           open1 <= close2 && close1 >= open2)
+        {
+            g_bullishEngulfing[index] = true;
+            LogDebug(symbol + ": Bullish engulfing detected");
+        }
+        
+        // Bearish engulfing
+        if(close2 > open2 && close1 < open1 &&
+           open1 >= close2 && close1 <= open2)
+        {
+            g_bearishEngulfing[index] = true;
+            LogDebug(symbol + ": Bearish engulfing detected");
+        }
+    }
+    
+    // Check pin bar
+    g_pinBarSignal[index] = DetectPinBar(symbol, PatternTimeframe, 1);
+}
+
+//+------------------------------------------------------------------+
+//| Detect Pin Bar Pattern                                           |
+//+------------------------------------------------------------------+
+int DetectPinBar(string symbol, ENUM_TIMEFRAMES timeframe, int shift)
+{
+    double open = iOpen(symbol, timeframe, shift);
+    double close = iClose(symbol, timeframe, shift);
+    double high = iHigh(symbol, timeframe, shift);
+    double low = iLow(symbol, timeframe, shift);
+    
+    if(open <= 0 || close <= 0 || high <= 0 || low <= 0)
+        return 0;
+        
+    double bodySize = MathAbs(close - open);
+    double upperWick = high - MathMax(open, close);
+    double lowerWick = MathMin(open, close) - low;
+    
+    if(bodySize <= 0)
+        return 0;
+        
+    // Bullish pin bar (long lower wick)
+    if(lowerWick > bodySize * 2.0 && lowerWick > upperWick && close > open)
+        return 1;
+        
+    // Bearish pin bar (long upper wick)
+    if(upperWick > bodySize * 2.0 && upperWick > lowerWick && close < open)
+        return -1;
+        
+    return 0;
+}
+
+//+------------------------------------------------------------------+
+//| Generate Trading Signals                                         |
+//+------------------------------------------------------------------+
+void GenerateSignals(int index)
+{
+    string symbol = g_symbols[index].symbol;
+    int symIndex = GetSymbolIndex(symbol);
+    
+    g_symbols[index].bullishSignal = false;
+    g_symbols[index].sellSignal = false;
+    
+    if(symIndex < 0)
+        return;
+        
+    // Get signals from PriceAction library
+    bool priceAbove = g_symbolData[symIndex].priceIsAbove;
+    bool priceBelow = g_symbolData[symIndex].priceIsBelow;
+    bool bullishFib = g_symbolData[symIndex].isBullishFib;
+    bool bearishFib = g_symbolData[symIndex].isBearishFib;
+    
+    // Generate buy signal
+    if(bullishFib && priceAbove)
+    {
+        if(!RequireEngulfing || g_bullishEngulfing[index])
+        {
+            if(!RequirePinBar || g_pinBarSignal[index] == 1)
+            {
+                g_symbols[index].bullishSignal = true;
+                LogDebug(symbol + ": Buy signal generated");
+            }
+        }
+    }
+    
+    // Generate sell signal
+    if(bearishFib && priceBelow)
+    {
+        if(!RequireEngulfing || g_bearishEngulfing[index])
+        {
+            if(!RequirePinBar || g_pinBarSignal[index] == -1)
+            {
+                g_symbols[index].sellSignal = true;
+                LogDebug(symbol + ": Sell signal generated");
+            }
+        }
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Validate Buy Signal                                              |
+//+------------------------------------------------------------------+
+bool ValidateBuySignal(int index)
+{
+    string symbol = g_symbols[index].symbol;
+    
+    // Check if enough time has passed since last trade
+    if(g_symbols[index].lastTradeTime > 0)
+    {
+        datetime timeSinceLastTrade = TimeCurrent() - g_symbols[index].lastTradeTime;
+        if(timeSinceLastTrade < 300) // 5 minutes minimum between trades
+            return false;
+    }
+    
+    // Additional validation can be added here
+    return true;
+}
+
+//+------------------------------------------------------------------+
+//| Validate Sell Signal                                             |
+//+------------------------------------------------------------------+
+bool ValidateSellSignal(int index)
+{
+    string symbol = g_symbols[index].symbol;
+    
+    // Check if enough time has passed since last trade
+    if(g_symbols[index].lastTradeTime > 0)
+    {
+        datetime timeSinceLastTrade = TimeCurrent() - g_symbols[index].lastTradeTime;
+        if(timeSinceLastTrade < 300) // 5 minutes minimum between trades
+            return false;
+    }
+    
+    // Additional validation can be added here
+    return true;
+}
+
+//+------------------------------------------------------------------+
+//| Execute Buy Trade                                                |
+//+------------------------------------------------------------------+
+bool ExecuteBuyTrade(int index)
+{
+    string symbol = g_symbols[index].symbol;
+    
+    if(!g_symbolInfo.Name(symbol))
+        return false;
+        
+    g_symbolInfo.RefreshRates();
+    
+    double price = g_symbolInfo.Ask();
+    double stopLoss = NormalizeDouble(price - g_symbols[index].stopLoss, g_symbolInfo.Digits());
+    double takeProfit = NormalizeDouble(price + (g_symbols[index].stopLoss * RiskRewardRatio), g_symbolInfo.Digits());
+    double lotSize = g_symbols[index].lotSize;
+    
+    // Validate levels
+    if(stopLoss >= price || takeProfit <= price)
+    {
+        Print(symbol, ": Invalid SL/TP levels for buy trade");
+        return false;
+    }
+    
+    // Execute trade
+    if(g_trade.Buy(lotSize, symbol, price, stopLoss, takeProfit, "PA_BUY_" + symbol))
+    {
+        if(g_trade.ResultRetcode() == TRADE_RETCODE_DONE)
+        {
+            g_symbols[index].lastTradeTime = TimeCurrent();
+            g_symbols[index].currentSL = stopLoss;
+            g_symbols[index].currentTP = takeProfit;
+            
+            PrintFormat("✅ BUY %s: Price=%.5f SL=%.5f TP=%.5f Lot=%.2f",
+                       symbol, price, stopLoss, takeProfit, lotSize);
+            return true;
+        }
+    }
+    
+    PrintFormat("❌ Failed to open BUY %s: Error %d", symbol, g_trade.ResultRetcode());
+    return false;
+}
+
+//+------------------------------------------------------------------+
+//| Execute Sell Trade                                               |
+//+------------------------------------------------------------------+
+bool ExecuteSellTrade(int index)
+{
+    string symbol = g_symbols[index].symbol;
+    
+    if(!g_symbolInfo.Name(symbol))
+        return false;
+        
+    g_symbolInfo.RefreshRates();
+    
+    double price = g_symbolInfo.Bid();
+    double stopLoss = NormalizeDouble(price + g_symbols[index].stopLoss, g_symbolInfo.Digits());
+    double takeProfit = NormalizeDouble(price - (g_symbols[index].stopLoss * RiskRewardRatio), g_symbolInfo.Digits());
+    double lotSize = g_symbols[index].lotSize;
+    
+    // Validate levels
+    if(stopLoss <= price || takeProfit >= price)
+    {
+        Print(symbol, ": Invalid SL/TP levels for sell trade");
+        return false;
+    }
+    
+    // Execute trade
+    if(g_trade.Sell(lotSize, symbol, price, stopLoss, takeProfit, "PA_SELL_" + symbol))
+    {
+        if(g_trade.ResultRetcode() == TRADE_RETCODE_DONE)
+        {
+            g_symbols[index].lastTradeTime = TimeCurrent();
+            g_symbols[index].currentSL = stopLoss;
+            g_symbols[index].currentTP = takeProfit;
+            
+            PrintFormat("✅ SELL %s: Price=%.5f SL=%.5f TP=%.5f Lot=%.2f",
+                       symbol, price, stopLoss, takeProfit, lotSize);
+            return true;
+        }
+    }
+    
+    PrintFormat("❌ Failed to open SELL %s: Error %d", symbol, g_trade.ResultRetcode());
+    return false;
+}
+
+//+------------------------------------------------------------------+
+//| Check Trading Conditions                                         |
+//+------------------------------------------------------------------+
+bool CheckTradingConditions(int index)
+{
+    string symbol = g_symbols[index].symbol;
+    
+    // Check if news filter blocks trading
+    if(g_newsImpactActive)
+        return false;
+        
+    // Check trading hours
+    if(UseTradingHours && !IsWithinTradingHours())
+        return false;
+        
+    // Check spread
+    if(UseSpreadFilter && !IsSpreadAcceptable(symbol, g_symbols[index].maxSpread))
+        return false;
+        
+    // Check if symbol is paused due to losses
+    int symIndex = GetSymbolIndex(symbol);
+    if(symIndex >= 0 && g_symbolData[symIndex].tradingPaused)
+        return false;
+        
+    return true;
+}
+
+//+------------------------------------------------------------------+
+//| Manage Open Positions                                            |
+//+------------------------------------------------------------------+
+void ManageOpenPositions()
+{
+    for(int i = 0; i < g_symbolCount; i++)
+    {
+        if(!g_symbols[i].isActive || !g_symbols[i].hasPosition)
+            continue;
+            
+        string symbol = g_symbols[i].symbol;
+        
+        // Use PriceAction library's position modification
+        ModifyTrade(symbol);
+        
+        // Check for consecutive losses
+        ManageTradingPause(symbol);
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Count Active Symbols                                             |
+//+------------------------------------------------------------------+
+int CountActiveSymbols()
+{
+    int count = 0;
+    for(int i = 0; i < g_symbolCount; i++)
+    {
+        if(g_symbols[i].isActive)
+            count++;
+    }
+    return count;
+}
+
+//+------------------------------------------------------------------+
+//| Get Deinitialization Reason Text                                 |
+//+------------------------------------------------------------------+
+string GetDeinitReasonText(int reason)
+{
+    switch(reason)
+    {
+        case REASON_REMOVE:     return "EA removed by user";
+        case REASON_RECOMPILE:  return "EA recompiled";
+        case REASON_CHARTCHANGE: return "Chart changed";
+        case REASON_CHARTCLOSE: return "Chart closed";
+        case REASON_PARAMETERS: return "Parameters changed";
+        case REASON_ACCOUNT:    return "Account changed";
+        case REASON_TEMPLATE:   return "Template applied";
+        case REASON_INITFAILED: return "Initialization failed";
+        case REASON_CLOSE:      return "Terminal closed";
+        default:                return "Unknown reason";
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Trade Event Function                                              |
+//+------------------------------------------------------------------+
+void OnTrade()
+{
+    // Update position counts
+    g_totalPositions = GetActivePositionsCount();
+    
+    // Check each symbol for closed positions
+    for(int i = 0; i < g_symbolCount; i++)
+    {
+        string symbol = g_symbols[i].symbol;
+        
+        if(GetActivePositionsCount(symbol) == 0)
+        {
+            g_symbols[i].hasPosition = false;
+        }
+        else
+        {
+            g_symbols[i].hasPosition = true;
+        }
+    }
+}
+
+//+------------------------------------------------------------------+
