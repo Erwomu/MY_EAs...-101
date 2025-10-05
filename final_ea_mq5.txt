@@ -107,23 +107,18 @@ int             g_totalPositions = 0;
 //+------------------------------------------------------------------+
 int OnInit()
 {
-    // Initialize PriceAction library
+    // Initialize PriceAction library first
     if(!InitializePriceAction())
     {
         Print("Error: Failed to initialize PriceAction library");
         return INIT_FAILED;
     }
     
-    // Configure symbols for trading
+    // Configure symbols locally
     ConfigureSymbols();
     
-    // Initialize pattern arrays
-    ArrayResize(g_bullishEngulfing, g_symbolCount);
-    ArrayResize(g_bearishEngulfing, g_symbolCount);
-    ArrayResize(g_pinBarSignal, g_symbolCount);
-    
-    // Initialize symbols in PriceAction library
-    for(int i = 0; i < g_symbolCount; i++)
+    // Initialize each symbol in the PriceAction library
+    for(int i = 0; i < ArraySize(g_symbols); i++)
     {
         if(!InitializeSymbol(g_symbols[i].symbol, g_symbols[i].multiplier, g_symbols[i].maxSpread))
         {
@@ -136,6 +131,12 @@ int OnInit()
             PrintFormat("Symbol %s initialized successfully", g_symbols[i].symbol);
         }
     }
+    
+    // NOW resize pattern arrays based on YOUR symbol count
+    int localSymbolCount = ArraySize(g_symbols);
+    ArrayResize(g_bullishEngulfing, localSymbolCount);
+    ArrayResize(g_bearishEngulfing, localSymbolCount);
+    ArrayResize(g_pinBarSignal, localSymbolCount);
     
     // Set up trading object
     g_trade.SetExpertMagicNumber(123456);
