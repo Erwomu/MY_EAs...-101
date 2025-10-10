@@ -32,18 +32,18 @@ input POI_TYPE           PointOfInterest    = PIVOT_POINT;
 input ENUM_TIMEFRAMES    PivotTimeframe     = PERIOD_D1;
 //input ENUM_TIMEFRAMES    PatternTimeframe   = PERIOD_M5;
 
-sinput string            SEP2                = "=== Trading Hours ===";
+//sinput string            SEP2                = "=== Trading Hours ===";
 input bool               UseTradingHours    = true;
 /*input int                StartHour          = 10;
 input int                StartMinute        = 30;
 input int                EndHour            = 16;
 input int                EndMinute          = 0;*/
 
-sinput string            SEP3                = "=== Risk Management ===";
+/* sinput string            SEP3                = "=== Risk Management ===";
 input double             RiskPercent        = 0.5;           // Risk per trade (%)
 input double             MinStopLoss        = 20;            // Minimum SL in points
 input double             MaxStopLoss        = 85;            // Maximum SL in points
-input double             RiskRewardRatio    = 2.0;           // Risk:Reward ratio
+input double             RiskRewardRatio    = 2.0;           // Risk:Reward ratio */
 input int                MaxPositionsPerSymbol = 1;          // Max positions per symbol
 input int                MaxTotalPositions  = 3;             // Max total positions
 
@@ -107,18 +107,30 @@ int             g_totalPositions = 0;
 //+------------------------------------------------------------------+
 int OnInit()
 {
-    // Initialize PriceAction library first
+    // Initialize PriceAction library
     if(!InitializePriceAction())
     {
         Print("Error: Failed to initialize PriceAction library");
         return INIT_FAILED;
     }
     
-    // Configure symbols locally
+    // Configure symbols for trading
     ConfigureSymbols();
     
-    // Initialize each symbol in the PriceAction library
-    for(int i = 0; i < ArraySize(g_symbols); i++)
+    // Initialize pattern arrays
+    ArrayResize(g_bullishEngulfing, g_symbolCount);
+    ArrayResize(g_bearishEngulfing, g_symbolCount);
+    ArrayResize(g_pinBarSignal, g_symbolCount);
+    
+    // Initialize ATR handles FIRST
+    if(!InitializeATRHandles())
+    {
+        Print("Error: Failed to initialize ATR handles");
+        return INIT_FAILED;
+    }
+    
+    // Initialize symbols in PriceAction library
+    for(int i = 0; i < g_symbolCount; i++)
     {
         if(!InitializeSymbol(g_symbols[i].symbol, g_symbols[i].multiplier, g_symbols[i].maxSpread))
         {
@@ -128,15 +140,9 @@ int OnInit()
         else
         {
             g_symbols[i].isActive = true;
-            PrintFormat("Symbol %s initialized successfully", g_symbols[i].symbol);
+            PrintFormat("✅ Symbol %s initialized successfully", g_symbols[i].symbol);
         }
     }
-    
-    // NOW resize pattern arrays based on YOUR symbol count
-    int localSymbolCount = ArraySize(g_symbols);
-    ArrayResize(g_bullishEngulfing, localSymbolCount);
-    ArrayResize(g_bearishEngulfing, localSymbolCount);
-    ArrayResize(g_pinBarSignal, localSymbolCount);
     
     // Set up trading object
     g_trade.SetExpertMagicNumber(123456);
@@ -148,9 +154,11 @@ int OnInit()
     EventSetTimer(30);
     
     Print("=========================================");
-    Print("L'ACTION DE PRIX EA v2.0 Initialized");
+    Print("L'ACTION DE PRIX EA v2.1 (FIXED) Initialized");
     Print("Active Symbols: ", CountActiveSymbols());
-    Print("Risk Per Trade: ", RiskPercent, "%");
+    Print("Risk Per Trade: ", RiskPercentage, "%");
+    Print("Min SL: ", MinStopLoss, " points");
+    Print("Max SL: ", MaxStopLoss, " points");
     Print("=========================================");
     
     return INIT_SUCCEEDED;
@@ -161,6 +169,9 @@ int OnInit()
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason)
 {
+    // Release ATR handles FIRST
+    ReleaseATRHandles();
+    
     // Clean up PriceAction library
     DeinitializePriceAction();
     
