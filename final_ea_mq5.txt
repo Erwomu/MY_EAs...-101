@@ -442,44 +442,62 @@ double GetTolerance(string symbol)
 //+------------------------------------------------------------------+
 //| Detect Candlestick Patterns                                      |
 //+------------------------------------------------------------------+
-void DetectPatterns(int index)
+bool DetectBullishEngulfing(string symbol, ENUM_TIMEFRAMES timeframe)
 {
-    string symbol = g_symbols[index].symbol;
+    double open1 = iOpen(symbol, timeframe, 1);
+    double close1 = iClose(symbol, timeframe, 1);
+    double high1 = iHigh(symbol, timeframe, 1);
+    double low1 = iLow(symbol, timeframe, 1);
     
-    // Reset pattern flags
-    g_bullishEngulfing[index] = false;
-    g_bearishEngulfing[index] = false;
-    g_pinBarSignal[index] = 0;
+    double open2 = iOpen(symbol, timeframe, 2);
+    double close2 = iClose(symbol, timeframe, 2);
+    double high2 = iHigh(symbol, timeframe, 2);
+    double low2 = iLow(symbol, timeframe, 2);
     
-    // Check engulfing patterns
-    double open1 = iOpen(symbol, PatternTimeframe, 1);
-    double close1 = iClose(symbol, PatternTimeframe, 1);
-    double open2 = iOpen(symbol, PatternTimeframe, 2);
-    double close2 = iClose(symbol, PatternTimeframe, 2);
+    if(open1 <= 0 || close1 <= 0 || open2 <= 0 || close2 <= 0)
+        return false;
     
-    if(open1 > 0 && close1 > 0 && open2 > 0 && close2 > 0)
-    {
-        // Bullish engulfing
-        if(close2 < open2 && close1 > open1 && 
-           open1 <= close2 && close1 >= open2)
-        {
-            g_bullishEngulfing[index] = true;
-            LogDebug(symbol + ": Bullish engulfing detected");
-        }
-        
-        // Bearish engulfing
-        if(close2 > open2 && close1 < open1 &&
-           open1 >= close2 && close1 <= open2)
-        {
-            g_bearishEngulfing[index] = true;
-            LogDebug(symbol + ": Bearish engulfing detected");
-        }
-    }
+    // Calculate body sizes
+    double body1 = MathAbs(close1 - open1);
+    double body2 = MathAbs(close2 - open2);
     
-    // Check pin bar
-    g_pinBarSignal[index] = DetectPinBar(symbol, PatternTimeframe, 1);
+    if(body1 <= 0 || body2 <= 0)
+        return false;
+    
+    // Previous candle must be bearish
+    if(close2 >= open2)
+        return false;
+    
+    // Current candle must be bullish
+    if(close1 <= open1)
+        return false;
+    
+    // REALISTIC CONDITIONS:
+    // 1. Current body is at least 80% of previous body
+    if(body1 < body2 * 0.8)
+        return false;
+    
+    // 2. Current candle closes above midpoint of previous candle
+    double midpoint2 = (open2 + close2) / 2.0;
+    if(close1 <= midpoint2)
+        return false;
+    
+    // 3. Current candle opens below midpoint of previous candle
+    if(open1 >= midpoint2)
+        return false;
+    
+    // 4. Significant range (not tiny candles)
+    double avgBody = (body1 + body2) / 2.0;
+    double minBodySize = g_symbolInfo.Point() * 50;  // At least 5 pips
+    
+    if(avgBody < minBodySize)
+        return false;
+    
+    LogDebug(StringFormat("%s: Bullish engulfing detected. Body1: %.5f, Body2: %.5f", 
+                         symbol, body1, body2));
+    
+    return true;
 }
-
 //+------------------------------------------------------------------+
 //| Detect Pin Bar Pattern                                           |
 //+------------------------------------------------------------------+
