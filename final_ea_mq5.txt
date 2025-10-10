@@ -268,7 +268,8 @@ void OnTick()
             continue;
             
         // Detect patterns
-        DetectPatterns(i);
+        DetectBullishEngulfing(symbol,PatternTimeframe);
+        DetectPinBar(symbol,PatternTimeframe,5);
         
         // Check price position
         double keyLevel = (g_symbols[i].fibLevel + g_symbols[i].keyLevel) / 2;
