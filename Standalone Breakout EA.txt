@@ -1,0 +1,1259 @@
+//| Get ATR Value                                                    |
+//+------------------------------------------------------------------+
+double GetATRValue(const int index)
+{
+    if(g_eaATRHandles[index] == INVALID_HANDLE)
+        return 0;
+    
+    double atrBuffer[];
+    ArraySetAsSeries(atrBuffer, true);
+    
+    if(CopyBuffer(g_eaATRHandles[index], 0, 0, 1, atrBuffer) <= 0)
+    {
+        PrintFormat("ERROR: Failed to copy ATR buffer for index %d", index);
+        return 0;
+    }
+    
+    return atrBuffer[0];
+}
+
+//+------------------------------------------------------------------+
+//| Manage Positions                                                 |
+//+------------------------------------------------------------------+
+void ManagePositions(const string symbol, const int index)
+{
+    double atr = GetATRValue(index);
+    if(atr <= 0)
+        return;
+    
+    for(int i = PositionsTotal() - 1; i >= 0; i--)
+    {
+        if(!g_eaPosition.SelectByIndex(i))
+            continue;
+        
+        if(g_eaPosition.Symbol() != symbol || g_eaPosition.Magic() != MagicNumber)
+            continue;
+        
+        if(!g_eaSymbolInfo.Name(symbol))
+            continue;
+        
+        g_eaSymbolInfo.RefreshRates();
+        
+        double currentSL = g_eaPosition.StopLoss();
+        double openPrice = g_eaPosition.PriceOpen();
+        int digits = (int)g_eaSymbolInfo.Digits();
+        
+        bool modified = false;
+        double newSL = 0.0;
+        
+        if(g_eaPosition.PositionType() == POSITION_TYPE_BUY)
+        {
+            double bid = g_eaSymbolInfo.Bid();
+            double profitDistance = bid - openPrice;
+            
+            if(profitDistance >= (atr * BEMultiplier) && currentSL < openPrice)
+            {
+                newSL = NormalizeDouble(openPrice + (g_eaSymbolInfo.Point() * 10), digits);
+                modified = true;
+                PrintFormat("%s BUY: Moving to Break-Even at %.5f", symbol, newSL);
+            }
+            else if(profitDistance >= (atr * TrailStartMultiplier) && currentSL >= openPrice)
+            {
+                double trailSL = NormalizeDouble(bid - (atr * TrailStopMultiplier), digits);
+                if(trailSL > currentSL)
+                {
+                    newSL = trailSL;
+                    modified = true;
+                    PrintFormat("%s BUY: Trailing SL to %.5f", symbol, newSL);
+                }
+            }
+        }
+        else if(g_eaPosition.PositionType() == POSITION_TYPE_SELL)
+        {
+            double ask = g_eaSymbolInfo.Ask();
+            double profitDistance = openPrice - ask;
+            
+            if(profitDistance >= (atr * BEMultiplier) && (currentSL == 0 || currentSL > openPrice))
+            {
+                newSL = NormalizeDouble(openPrice - (g_eaSymbolInfo.Point() * 10), digits);
+                modified = true;
+                PrintFormat("%s SELL: Moving to Break-Even at %.5f", symbol, newSL);
+            }
+            else if(profitDistance >= (atr * TrailStartMultiplier) && currentSL > 0 && currentSL <= openPrice)
+            {
+                double trailSL = NormalizeDouble(ask + (atr * TrailStopMultiplier), digits);
+                if(currentSL == 0 || trailSL < currentSL)
+                {
+                    newSL = trailSL;
+                    modified = true;
+                    PrintFormat("%s SELL: Trailing SL to %.5f", symbol, newSL);
+                }
+            }
+        }
+        
+        if(modified && newSL > 0)
+        {
+            if(g_eaTrade.PositionModify(g_eaPosition.Ticket(), newSL, g_eaPosition.TakeProfit()))
+            {
+                if(g_eaTrade.ResultRetcode() == TRADE_RETCODE_DONE)
+                {
+                    PrintFormat("%s: SL modified successfully to %.5f", symbol, newSL);
+                }
+            }
+            else
+            {
+                PrintFormat("%s: Failed to modify SL | Error:%d", symbol, g_eaTrade.ResultRetcode());
+            }
+        }
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Check Trading Session                                            |
+//+------------------------------------------------------------------+
+bool IsInTradingSession()
+{
+    MqlDateTime current;
+    TimeToStruct(TimeCurrent(), current);
+    int currentHour = current.hour;
+    
+    if(currentHour >= LondonStart && currentHour < LondonEnd)
+        return true;
+    
+    if(currentHour >= NewYorkStart && currentHour < NewYorkEnd)
+        return true;
+    
+    return false;
+}
+
+//+------------------------------------------------------------------+
+//| Check Weekend Time                                               |
+//+------------------------------------------------------------------+
+bool IsWeekendTime()
+{
+    MqlDateTime current;
+    TimeToStruct(TimeCurrent(), current);
+    
+    if(current.day_of_week == 5 && current.hour >= 20)
+        return true;
+    
+    if(current.day_of_week == 0 && current.hour < 21)
+        return true;
+    
+    return false;
+}
+
+//+------------------------------------------------------------------+
+//| Check Spread                                                     |
+//+------------------------------------------------------------------+
+bool IsSpreadAcceptable(const string symbol)
+{
+    if(!g_eaSymbolInfo.Name(symbol))
+        return false;
+    
+    g_eaSymbolInfo.RefreshRates();
+    
+    double spread = g_eaSymbolInfo.Spread() * g_eaSymbolInfo.Point();
+    double maxSpread = MaxSpreadPips * g_eaSymbolInfo.Point() * 10;
+    
+    if(spread > maxSpread)
+    {
+        PrintFormat("%s: Spread %.1f pips exceeds maximum %.1f pips", 
+                   symbol, spread / (g_eaSymbolInfo.Point() * 10), MaxSpreadPips);
+        return false;
+    }
+    
+    return true;
+}
+
+//+------------------------------------------------------------------+
+//| Get Symbol Positions Count                                       |
+//+------------------------------------------------------------------+
+int GetSymbolPositionsCount(const string symbol)
+{
+    int count = 0;
+    
+    for(int i = 0; i < PositionsTotal(); i++)
+    {
+        if(g_eaPosition.SelectByIndex(i))
+        {
+            if(g_eaPosition.Symbol() == symbol && g_eaPosition.Magic() == MagicNumber)
+                count++;
+        }
+    }
+    
+    return count;
+}
+
+//+------------------------------------------------------------------+
+//| Get All Positions Count                                          |
+//+------------------------------------------------------------------+
+int GetAllPositionsCount()
+{
+    int count = 0;
+    
+    for(int i = 0; i < PositionsTotal(); i++)
+    {
+        if(g_eaPosition.SelectByIndex(i))
+        {
+            if(g_eaPosition.Magic() == MagicNumber)
+                count++;
+        }
+    }
+    
+    return count;
+}
+
+//+------------------------------------------------------------------+
+//| Update Statistics                                                |
+//+------------------------------------------------------------------+
+void UpdateStatistics()
+{
+    if(!HistorySelect(0, TimeCurrent()))
+        return;
+    
+    for(int i = 0; i < 3; i++)
+    {
+        if(g_symbols[i] == "")
+            continue;
+        
+        double totalProfit = 0;
+        int totalTrades = 0;
+        int wins = 0;
+        int losses = 0;
+        int consecLosses = 0;
+        
+        for(int j = HistoryDealsTotal() - 1; j >= 0; j--)
+        {
+            ulong ticket = HistoryDealGetTicket(j);
+            if(ticket == 0)
+                continue;
+            
+            if(HistoryDealGetString(ticket, DEAL_SYMBOL) != g_symbols[i])
+                continue;
+            
+            if(HistoryDealGetInteger(ticket, DEAL_MAGIC) != MagicNumber)
+                continue;
+            
+            if(HistoryDealGetInteger(ticket, DEAL_ENTRY) != DEAL_ENTRY_OUT)
+                continue;
+            
+            double profit = HistoryDealGetDouble(ticket, DEAL_PROFIT);
+            totalProfit += profit;
+            totalTrades++;
+            
+            if(profit > 0)
+            {
+                wins++;
+                consecLosses = 0;
+            }
+            else if(profit < 0)
+            {
+                losses++;
+                consecLosses++;
+            }
+            
+            if(consecLosses > g_stats[i].consecutiveLosses)
+                g_stats[i].consecutiveLosses = consecLosses;
+        }
+        
+        g_stats[i].totalProfit = totalProfit;
+        g_stats[i].totalTrades = totalTrades;
+        g_stats[i].winningTrades = wins;
+        g_stats[i].losingTrades = losses;
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Create Dashboard                                                 |
+//+------------------------------------------------------------------+
+bool CreateDashboard()
+{
+    int y = DashboardY;
+    string fontName = "Consolas";
+    
+    if(!ObjectCreate(0, "Dashboard_Title", OBJ_LABEL, 0, 0, 0))
+        return false;
+    
+    ObjectSetInteger(0, "Dashboard_Title", OBJPROP_XDISTANCE, DashboardX);
+    ObjectSetInteger(0, "Dashboard_Title", OBJPROP_YDISTANCE, y);
+    ObjectSetString(0, "Dashboard_Title", OBJPROP_TEXT, "=== BREAKOUT EA v2.0 ===");
+    ObjectSetInteger(0, "Dashboard_Title", OBJPROP_COLOR, clrGold);
+    ObjectSetInteger(0, "Dashboard_Title", OBJPROP_FONTSIZE, DashboardFontSize + 2);
+    ObjectSetString(0, "Dashboard_Title", OBJPROP_FONT, "Arial Bold");
+    ObjectSetInteger(0, "Dashboard_Title", OBJPROP_CORNER, CORNER_LEFT_UPPER);
+    
+    y += 25;
+    
+    ObjectCreate(0, "Dashboard_Account", OBJ_LABEL, 0, 0, 0);
+    ObjectSetInteger(0, "Dashboard_Account", OBJPROP_XDISTANCE, DashboardX);
+    ObjectSetInteger(0, "Dashboard_Account", OBJPROP_YDISTANCE, y);
+    ObjectSetInteger(0, "Dashboard_Account", OBJPROP_COLOR, DashboardColor);
+    ObjectSetInteger(0, "Dashboard_Account", OBJPROP_FONTSIZE, DashboardFontSize);
+    ObjectSetString(0, "Dashboard_Account", OBJPROP_FONT, fontName);
+    ObjectSetInteger(0, "Dashboard_Account", OBJPROP_CORNER, CORNER_LEFT_UPPER);
+    
+    y += 20;
+    
+    ObjectCreate(0, "Dashboard_Session", OBJ_LABEL, 0, 0, 0);
+    ObjectSetInteger(0, "Dashboard_Session", OBJPROP_XDISTANCE, DashboardX);
+    ObjectSetInteger(0, "Dashboard_Session", OBJPROP_YDISTANCE, y);
+    ObjectSetInteger(0, "Dashboard_Session", OBJPROP_COLOR, DashboardColor);
+    ObjectSetInteger(0, "Dashboard_Session", OBJPROP_FONTSIZE, DashboardFontSize);
+    ObjectSetString(0, "Dashboard_Session", OBJPROP_FONT, fontName);
+    ObjectSetInteger(0, "Dashboard_Session", OBJPROP_CORNER, CORNER_LEFT_UPPER);
+    
+    y += 25;
+    
+    ObjectCreate(0, "Dashboard_Header", OBJ_LABEL, 0, 0, 0);
+    ObjectSetInteger(0, "Dashboard_Header", OBJPROP_XDISTANCE, DashboardX);
+    ObjectSetInteger(0, "Dashboard_Header", OBJPROP_YDISTANCE, y);
+    ObjectSetString(0, "Dashboard_Header", OBJPROP_TEXT, "-------------------------");
+    ObjectSetInteger(0, "Dashboard_Header", OBJPROP_COLOR, clrDarkGray);
+    ObjectSetInteger(0, "Dashboard_Header", OBJPROP_FONTSIZE, DashboardFontSize);
+    ObjectSetString(0, "Dashboard_Header", OBJPROP_FONT, fontName);
+    ObjectSetInteger(0, "Dashboard_Header", OBJPROP_CORNER, CORNER_LEFT_UPPER);
+    
+    y += 18;
+    
+    for(int i = 0; i < 3; i++)
+    {
+        string labelName = "Dashboard_Symbol_" + IntegerToString(i);
+        ObjectCreate(0, labelName, OBJ_LABEL, 0, 0, 0);
+        ObjectSetInteger(0, labelName, OBJPROP_XDISTANCE, DashboardX);
+        ObjectSetInteger(0, labelName, OBJPROP_YDISTANCE, y);
+        ObjectSetInteger(0, labelName, OBJPROP_COLOR, DashboardColor);
+        ObjectSetInteger(0, labelName, OBJPROP_FONTSIZE, DashboardFontSize);
+        ObjectSetString(0, labelName, OBJPROP_FONT, fontName);
+        ObjectSetInteger(0, labelName, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+        y += 16;
+    }
+    
+    ChartRedraw();
+    return true;
+}
+
+//+------------------------------------------------------------------+
+//| Update Dashboard                                                 |
+//+------------------------------------------------------------------+
+void UpdateDashboard()
+{
+    double balance = AccountInfoDouble(ACCOUNT_BALANCE);
+    double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+    double profit = equity - balance;
+    int totalPos = GetAllPositionsCount();
+    
+    string accountText = StringFormat("Balance: $%.2f | Equity: $%.2f | P/L: $%.2f | Pos: %d/%d",
+                                     balance, equity, profit, totalPos, MaxTotalPositions);
+    ObjectSetString(0, "Dashboard_Account", OBJPROP_TEXT, accountText);
+    ObjectSetInteger(0, "Dashboard_Account", OBJPROP_COLOR, profit >= 0 ? clrLime : clrRed);
+    
+    bool inSession = IsInTradingSession();
+    string sessionText = StringFormat("Session: %s | HTF: %s | LTF: %s",
+                                     inSession ? "ACTIVE" : "CLOSED",
+                                     EnumToString(HTF_Period),
+                                     EnumToString(LTF_Period));
+    ObjectSetString(0, "Dashboard_Session", OBJPROP_TEXT, sessionText);
+    ObjectSetInteger(0, "Dashboard_Session", OBJPROP_COLOR, inSession ? clrLime : clrOrange);
+    
+    for(int i = 0; i < 3; i++)
+    {
+        string labelName = "Dashboard_Symbol_" + IntegerToString(i);
+        
+        if(g_symbols[i] == "")
+        {
+            ObjectSetString(0, labelName, OBJPROP_TEXT, "");
+            continue;
+        }
+        
+        string status = "-";
+        color textColor = clrGray;
+        
+        int positions = GetSymbolPositionsCount(g_symbols[i]);
+        
+        if(positions > 0)
+        {
+            double symbolProfit = 0;
+            for(int j = 0; j < PositionsTotal(); j++)
+            {
+                if(g_eaPosition.SelectByIndex(j))
+                {
+                    if(g_eaPosition.Symbol() == g_symbols[i] && g_eaPosition.Magic() == MagicNumber)
+                    {
+                        symbolProfit += g_eaPosition.Profit() + g_eaPosition.Swap() + g_eaPosition.Commission();
+                    }
+                }
+            }
+            
+            status = StringFormat("%.2f", symbolProfit);
+            textColor = symbolProfit >= 0 ? clrLime : clrRed;
+        }
+        else if(g_htfData[i].breakoutUp)
+        {
+            status = "UP";
+            textColor = clrAqua;
+        }
+        else if(g_htfData[i].breakoutDown)
+        {
+            status = "DOWN";
+            textColor = clrOrange;
+        }
+        else if(!g_stats[i].tradingEnabled)
+        {
+            status = "PAUSED";
+            textColor = clrRed;
+        }
+        else
+        {
+            status = "WAITING";
+            textColor = clrGray;
+        }
+        
+        string winRate = g_stats[i].totalTrades > 0 ? 
+                        StringFormat("%.0f%%", (double)g_stats[i].winningTrades / g_stats[i].totalTrades * 100) : 
+                        "-";
+        
+        string text = StringFormat("%s: %s | W/L:%d/%d(%s)", 
+                                  g_symbols[i], status,
+                                  g_stats[i].winningTrades, 
+                                  g_stats[i].losingTrades,
+                                  winRate);
+        
+        ObjectSetString(0, labelName, OBJPROP_TEXT, text);
+        ObjectSetInteger(0, labelName, OBJPROP_COLOR, textColor);
+    }
+    
+    ChartRedraw();
+}
+
+//+------------------------------------------------------------------+
+//| Remove Dashboard                                                 |
+//+------------------------------------------------------------------+
+void RemoveDashboard()
+{
+    ObjectDelete(0, "Dashboard_Title");
+    ObjectDelete(0, "Dashboard_Account");
+    ObjectDelete(0, "Dashboard_Session");
+    ObjectDelete(0, "Dashboard_Header");
+    
+    for(int i = 0; i < 3; i++)
+    {
+        ObjectDelete(0, "Dashboard_Symbol_" + IntegerToString(i));
+    }
+    
+    ChartRedraw();
+}
+
+//+------------------------------------------------------------------+
+//| Trade Event Handler                                              |
+//+------------------------------------------------------------------+
+void OnTrade()
+{
+    UpdateStatistics();
+    
+    if(ShowDashboard)
+    {
+        UpdateDashboard();
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Get Deinitialization Reason Text                                 |
+//+------------------------------------------------------------------+
+string GetDeinitReasonText(const int reason)
+{
+    switch(reason)
+    {
+        case REASON_PROGRAM: return "Program stopped";
+        case REASON_REMOVE: return "EA removed from chart";
+        case REASON_RECOMPILE: return "EA recompiled";
+        case REASON_CHARTCHANGE: return "Chart symbol/period changed";
+        case REASON_CHARTCLOSE: return "Chart closed";
+        case REASON_PARAMETERS: return "Input parameters changed";
+        case REASON_ACCOUNT: return "Account changed";
+        case REASON_TEMPLATE: return "Template applied";
+        case REASON_INITFAILED: return "Initialization failed";
+        case REASON_CLOSE: return "Terminal closing";
+        default: return "Unknown reason";
+    }
+}
+
+//+------------------------------------------------------------------+
+//|                                                   BreakoutEA.mq5 |
+//|                                  Copyright 2025, Your Name       |
+//|                                             https://www.mql5.com |
+//+------------------------------------------------------------------+
+#property copyright "Copyright 2025, Your Name"
+#property link      "https://www.mql5.com"
+#property version   "2.00"
+#property strict
+#property description "HTF Breakout Trading System with Advanced Risk Management"
+
+//+------------------------------------------------------------------+
+//| Include Files                                                    |
+//+------------------------------------------------------------------+
+#include <Trade\Trade.mqh>
+#include <Trade\SymbolInfo.mqh>
+#include <Trade\PositionInfo.mqh>
+#include <Trade\AccountInfo.mqh>
+
+//+------------------------------------------------------------------+
+//| Input Parameters                                                 |
+//+------------------------------------------------------------------+
+sinput string            GENERAL_PARAMS        = "=== General Settings ===";
+input ENUM_TIMEFRAMES    HTF_Period            = PERIOD_D1;        // Higher TimeFrame
+input ENUM_TIMEFRAMES    LTF_Period            = PERIOD_H1;        // Lower TimeFrame
+input string             Symbol1               = "EURUSD";         // Symbol 1
+input string             Symbol2               = "GBPUSD";         // Symbol 2
+input string             Symbol3               = "USDJPY";         // Symbol 3
+input int                MagicNumber           = 234567;           // Magic Number
+
+sinput string            RISK_PARAMS           = "=== Risk Management ===";
+input double             RiskPercent           = 1.0;              // Risk per trade (%)
+input int                MaxOpenPositions      = 2;                // Max open positions per symbol
+input int                MaxTotalPositions     = 6;                // Max total positions
+input int                MaxConsecutiveLosses  = 3;                // Max consecutive losses before pause
+input double             MinRiskReward         = 1.5;              // Minimum Risk:Reward ratio
+input double             MaxSpreadPips         = 3.0;              // Maximum spread in pips
+
+sinput string            TRAILING_PARAMS       = "=== Trailing Stop Settings ===";
+input double             BEMultiplier          = 1.5;              // Break-even trigger (ATR multiplier)
+input double             TrailStartMultiplier  = 2.0;              // Trail start (ATR multiplier)
+input double             TrailStopMultiplier   = 1.0;              // Trail distance (ATR multiplier)
+
+sinput string            TRADING_PARAMS        = "=== Trading Parameters ===";
+input int                ATRPeriod             = 14;               // ATR Period
+input double             ATRStopLoss           = 2.0;              // Stop Loss (ATR multiplier)
+input double             ATRTakeProfit         = 3.0;              // Take Profit (ATR multiplier)
+input bool               UseTwoCandles         = true;             // Use 2 candles confirmation
+input bool               UseCandlePatterns     = false;            // Use candlestick patterns
+input double             MinCandleBodyRatio    = 0.3;              // Min candle body ratio for patterns
+
+sinput string            FILTER_PARAMS         = "=== Filter Settings ===";
+input bool               UseSessionFilter      = true;             // Enable session filter
+input int                LondonStart           = 8;                // London session start (hour)
+input int                LondonEnd             = 17;               // London session end (hour)
+input int                NewYorkStart          = 13;               // New York session start (hour)
+input int                NewYorkEnd            = 22;               // New York session end (hour)
+input bool               UseSpreadFilter       = true;             // Enable spread filter
+input bool               AvoidWeekends         = true;             // Avoid Friday/Sunday trades
+
+sinput string            DISPLAY_PARAMS        = "=== Display Settings ===";
+input bool               ShowDashboard         = true;             // Show dashboard
+input int                DashboardX            = 20;               // Dashboard X position
+input int                DashboardY            = 50;               // Dashboard Y position
+input color              DashboardColor        = clrWhite;         // Dashboard text color
+input int                DashboardFontSize     = 8;                // Dashboard font size
+
+//+------------------------------------------------------------------+
+//| Structure for Previous HTF Data                                  |
+//+------------------------------------------------------------------+
+struct HTFData
+{
+    double open;
+    double close;
+    double high;
+    double low;
+    datetime time;
+    bool breakoutUp;
+    bool breakoutDown;
+    double breakLevel;
+    int confirmationCandles;
+    bool tradeExecuted;
+    
+    void Reset()
+    {
+        open = 0;
+        close = 0;
+        high = 0;
+        low = 0;
+        time = 0;
+        breakoutUp = false;
+        breakoutDown = false;
+        breakLevel = 0;
+        confirmationCandles = 0;
+        tradeExecuted = false;
+    }
+    
+    HTFData()
+    {
+        Reset();
+    }
+};
+
+//+------------------------------------------------------------------+
+//| Structure for Symbol Trading Stats                               |
+//+------------------------------------------------------------------+
+struct SymbolStats
+{
+    int consecutiveLosses;
+    datetime pausedUntil;
+    bool tradingEnabled;
+    datetime lastTradeTime;
+    double totalProfit;
+    int totalTrades;
+    int winningTrades;
+    int losingTrades;
+    
+    void Reset()
+    {
+        consecutiveLosses = 0;
+        pausedUntil = 0;
+        tradingEnabled = true;
+        lastTradeTime = 0;
+        totalProfit = 0;
+        totalTrades = 0;
+        winningTrades = 0;
+        losingTrades = 0;
+    }
+    
+    SymbolStats()
+    {
+        Reset();
+    }
+};
+
+//+------------------------------------------------------------------+
+//| Global Variables                                                  |
+//+------------------------------------------------------------------+
+HTFData g_htfData[3];
+SymbolStats g_stats[3];
+string g_symbols[3];
+int g_eaATRHandles[3];  // Renamed to avoid conflict with PriceAction.mqh
+CAccountInfo g_account;
+CTrade g_eaTrade;  // Renamed to avoid conflict
+CSymbolInfo g_eaSymbolInfo;  // Renamed to avoid conflict
+CPositionInfo g_eaPosition;  // Renamed to avoid conflict
+datetime g_lastCheck = 0;
+bool g_initialized = false;
+
+//+------------------------------------------------------------------+
+//| Expert initialization function                                   |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+    Print("========================================");
+    Print("Initializing Breakout EA v2.00");
+    Print("========================================");
+    
+    // Setup trade object
+    g_eaTrade.SetExpertMagicNumber(MagicNumber);
+    g_eaTrade.SetDeviationInPoints(10);
+    g_eaTrade.SetTypeFilling(ORDER_FILLING_IOC);
+    g_eaTrade.SetAsyncMode(false);
+    g_eaTrade.LogLevel(LOG_LEVEL_ERRORS);
+    
+    // Setup symbols array
+    g_symbols[0] = Symbol1;
+    g_symbols[1] = Symbol2;
+    g_symbols[2] = Symbol3;
+    
+    // Validate and initialize each symbol
+    int validSymbols = 0;
+    for(int i = 0; i < 3; i++)
+    {
+        g_eaATRHandles[i] = INVALID_HANDLE;
+        
+        if(g_symbols[i] == "" || g_symbols[i] == "NONE")
+        {
+            g_symbols[i] = "";
+            continue;
+        }
+        
+        // Validate symbol exists
+        if(!SymbolInfoInteger(g_symbols[i], SYMBOL_SELECT))
+        {
+            if(!SymbolSelect(g_symbols[i], true))
+            {
+                PrintFormat("ERROR: Symbol %s not found", g_symbols[i]);
+                g_symbols[i] = "";
+                continue;
+            }
+        }
+        
+        // Create ATR indicator handle
+        g_eaATRHandles[i] = iATR(g_symbols[i], LTF_Period, ATRPeriod);
+        if(g_eaATRHandles[i] == INVALID_HANDLE)
+        {
+            PrintFormat("ERROR: Failed to create ATR handle for %s", g_symbols[i]);
+            g_symbols[i] = "";
+            continue;
+        }
+        
+        // Wait for indicator to calculate
+        Sleep(100);
+        
+        // Verify indicator is ready
+        double atrTest[];
+        if(CopyBuffer(g_eaATRHandles[i], 0, 0, 1, atrTest) <= 0)
+        {
+            PrintFormat("ERROR: ATR indicator not ready for %s", g_symbols[i]);
+            IndicatorRelease(g_eaATRHandles[i]);
+            g_eaATRHandles[i] = INVALID_HANDLE;
+            g_symbols[i] = "";
+            continue;
+        }
+        
+        // Initialize symbol data structures
+        g_htfData[i].Reset();
+        g_stats[i].Reset();
+        
+        // Mark previous HTF levels
+        if(!MarkPreviousHTF(g_symbols[i], i))
+        {
+            PrintFormat("WARNING: Failed to mark HTF levels for %s", g_symbols[i]);
+        }
+        
+        validSymbols++;
+        PrintFormat("Symbol initialized: %s (ATR Handle: %d)", g_symbols[i], g_eaATRHandles[i]);
+    }
+    
+    if(validSymbols == 0)
+    {
+        Print("ERROR: No valid symbols to trade");
+        return INIT_FAILED;
+    }
+    
+    PrintFormat("%d symbol(s) ready for trading", validSymbols);
+    
+    // Create dashboard
+    if(ShowDashboard)
+    {
+        if(!CreateDashboard())
+        {
+            Print("WARNING: Failed to create dashboard");
+        }
+    }
+    
+    EventSetTimer(60);
+    
+    g_initialized = true;
+    g_lastCheck = TimeCurrent();
+    
+    Print("========================================");
+    Print("Breakout EA initialized successfully!");
+    Print("========================================");
+    
+    return INIT_SUCCEEDED;
+}
+
+//+------------------------------------------------------------------+
+//| Expert deinitialization function                                 |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+    Print("========================================");
+    Print("Deinitializing Breakout EA");
+    PrintFormat("Reason: %s", GetDeinitReasonText(reason));
+    Print("========================================");
+    
+    EventKillTimer();
+    
+    // Release ATR handles
+    for(int i = 0; i < 3; i++)
+    {
+        if(g_eaATRHandles[i] != INVALID_HANDLE)
+        {
+            IndicatorRelease(g_eaATRHandles[i]);
+            g_eaATRHandles[i] = INVALID_HANDLE;
+        }
+    }
+    
+    // Remove dashboard
+    if(ShowDashboard)
+    {
+        RemoveDashboard();
+    }
+    
+    // Clean up chart objects
+    for(int i = 0; i < 3; i++)
+    {
+        if(g_symbols[i] != "")
+        {
+            ObjectDelete(0, "HTF_High_" + g_symbols[i]);
+            ObjectDelete(0, "HTF_Low_" + g_symbols[i]);
+            ObjectDelete(0, "HTF_Range_" + g_symbols[i]);
+        }
+    }
+    
+    ChartRedraw();
+    Print("Breakout EA deinitialized successfully");
+}
+
+//+------------------------------------------------------------------+
+//| Expert tick function                                             |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+    if(!g_initialized)
+        return;
+    
+    datetime currentTime = TimeCurrent();
+    if(currentTime - g_lastCheck < 60)
+        return;
+    
+    g_lastCheck = currentTime;
+    
+    for(int i = 0; i < 3; i++)
+    {
+        if(g_symbols[i] == "")
+            continue;
+        
+        ProcessSymbol(g_symbols[i], i);
+    }
+    
+    if(ShowDashboard)
+    {
+        UpdateDashboard();
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Timer function                                                   |
+//+------------------------------------------------------------------+
+void OnTimer()
+{
+    if(!g_initialized)
+        return;
+    
+    for(int i = 0; i < 3; i++)
+    {
+        if(g_symbols[i] != "")
+        {
+            CheckNewHTFCandle(g_symbols[i], i);
+        }
+    }
+    
+    UpdateStatistics();
+    
+    if(ShowDashboard)
+    {
+        UpdateDashboard();
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Process Symbol Trading Logic                                     |
+//+------------------------------------------------------------------+
+void ProcessSymbol(const string symbol, const int index)
+{
+    if(!g_stats[index].tradingEnabled)
+    {
+        if(TimeCurrent() >= g_stats[index].pausedUntil)
+        {
+            g_stats[index].tradingEnabled = true;
+            g_stats[index].consecutiveLosses = 0;
+            PrintFormat("%s: Trading resumed", symbol);
+        }
+        else
+        {
+            return;
+        }
+    }
+    
+    if(UseSessionFilter && !IsInTradingSession())
+        return;
+    
+    if(AvoidWeekends && IsWeekendTime())
+        return;
+    
+    if(g_stats[index].consecutiveLosses >= MaxConsecutiveLosses)
+    {
+        g_stats[index].tradingEnabled = false;
+        g_stats[index].pausedUntil = iTime(symbol, PERIOD_D1, 0) + 86400;
+        PrintFormat("%s: Trading paused due to %d consecutive losses", 
+                   symbol, g_stats[index].consecutiveLosses);
+        return;
+    }
+    
+    int currentPositions = GetSymbolPositionsCount(symbol);
+    if(currentPositions >= MaxOpenPositions)
+    {
+        ManagePositions(symbol, index);
+        return;
+    }
+    
+    int totalPositions = GetAllPositionsCount();
+    if(totalPositions >= MaxTotalPositions)
+    {
+        ManagePositions(symbol, index);
+        return;
+    }
+    
+    if(currentPositions > 0)
+    {
+        ManagePositions(symbol, index);
+        return;
+    }
+    
+    CheckNewHTFCandle(symbol, index);
+    
+    if(!g_htfData[index].tradeExecuted && CheckBreakout(symbol, index))
+    {
+        if(CheckEntryConfirmation(symbol, index))
+        {
+            if(UseSpreadFilter && !IsSpreadAcceptable(symbol))
+            {
+                PrintFormat("%s: Spread too high, skipping trade", symbol);
+                return;
+            }
+            
+            if(ExecuteBreakoutTrade(symbol, index))
+            {
+                g_htfData[index].tradeExecuted = true;
+                g_stats[index].lastTradeTime = TimeCurrent();
+            }
+        }
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Check for New HTF Candle                                         |
+//+------------------------------------------------------------------+
+void CheckNewHTFCandle(const string symbol, const int index)
+{
+    datetime currentHTF = iTime(symbol, HTF_Period, 0);
+    
+    if(currentHTF != g_htfData[index].time)
+    {
+        if(g_htfData[index].time > 0)
+        {
+            PrintFormat("%s: New %s candle detected", symbol, EnumToString(HTF_Period));
+        }
+        
+        MarkPreviousHTF(symbol, index);
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Mark Previous HTF Levels                                         |
+//+------------------------------------------------------------------+
+bool MarkPreviousHTF(const string symbol, const int index)
+{
+    double open[], close[], high[], low[];
+    datetime time[];
+    
+    if(CopyOpen(symbol, HTF_Period, 1, 1, open) <= 0 ||
+       CopyClose(symbol, HTF_Period, 1, 1, close) <= 0 ||
+       CopyHigh(symbol, HTF_Period, 1, 1, high) <= 0 ||
+       CopyLow(symbol, HTF_Period, 1, 1, low) <= 0 ||
+       CopyTime(symbol, HTF_Period, 0, 1, time) <= 0)
+    {
+        PrintFormat("ERROR: Failed to copy HTF data for %s", symbol);
+        return false;
+    }
+    
+    g_htfData[index].open = open[0];
+    g_htfData[index].close = close[0];
+    g_htfData[index].high = high[0];
+    g_htfData[index].low = low[0];
+    g_htfData[index].time = time[0];
+    g_htfData[index].breakoutUp = false;
+    g_htfData[index].breakoutDown = false;
+    g_htfData[index].confirmationCandles = 0;
+    g_htfData[index].tradeExecuted = false;
+    
+    if(symbol == _Symbol)
+    {
+        DrawHTFLevels(symbol, index);
+    }
+    
+    PrintFormat("%s HTF: H:%.5f L:%.5f O:%.5f C:%.5f", 
+               symbol, g_htfData[index].high, g_htfData[index].low, 
+               g_htfData[index].open, g_htfData[index].close);
+    
+    return true;
+}
+
+//+------------------------------------------------------------------+
+//| Draw HTF Levels                                                  |
+//+------------------------------------------------------------------+
+void DrawHTFLevels(const string symbol, const int index)
+{
+    datetime startTime = iTime(symbol, HTF_Period, 1);
+    datetime endTime = TimeCurrent() + PeriodSeconds(HTF_Period) * 2;
+    
+    ObjectDelete(0, "HTF_High_" + symbol);
+    ObjectCreate(0, "HTF_High_" + symbol, OBJ_TREND, 0, startTime, g_htfData[index].high, endTime, g_htfData[index].high);
+    ObjectSetInteger(0, "HTF_High_" + symbol, OBJPROP_COLOR, clrGreen);
+    ObjectSetInteger(0, "HTF_High_" + symbol, OBJPROP_WIDTH, 2);
+    ObjectSetInteger(0, "HTF_High_" + symbol, OBJPROP_STYLE, STYLE_SOLID);
+    ObjectSetInteger(0, "HTF_High_" + symbol, OBJPROP_RAY_RIGHT, true);
+    
+    ObjectDelete(0, "HTF_Low_" + symbol);
+    ObjectCreate(0, "HTF_Low_" + symbol, OBJ_TREND, 0, startTime, g_htfData[index].low, endTime, g_htfData[index].low);
+    ObjectSetInteger(0, "HTF_Low_" + symbol, OBJPROP_COLOR, clrRed);
+    ObjectSetInteger(0, "HTF_Low_" + symbol, OBJPROP_WIDTH, 2);
+    ObjectSetInteger(0, "HTF_Low_" + symbol, OBJPROP_STYLE, STYLE_SOLID);
+    ObjectSetInteger(0, "HTF_Low_" + symbol, OBJPROP_RAY_RIGHT, true);
+    
+    ObjectDelete(0, "HTF_Range_" + symbol);
+    ObjectCreate(0, "HTF_Range_" + symbol, OBJ_RECTANGLE, 0, startTime, g_htfData[index].high, endTime, g_htfData[index].low);
+    ObjectSetInteger(0, "HTF_Range_" + symbol, OBJPROP_COLOR, clrDarkGray);
+    ObjectSetInteger(0, "HTF_Range_" + symbol, OBJPROP_FILL, true);
+    ObjectSetInteger(0, "HTF_Range_" + symbol, OBJPROP_BACK, true);
+    
+    ChartRedraw();
+}
+
+//+------------------------------------------------------------------+
+//| Check for Breakout                                               |
+//+------------------------------------------------------------------+
+bool CheckBreakout(const string symbol, const int index)
+{
+    double close[];
+    if(CopyClose(symbol, LTF_Period, 0, 1, close) <= 0)
+        return false;
+    
+    double currentPrice = close[0];
+    
+    if(currentPrice > g_htfData[index].high && !g_htfData[index].breakoutUp)
+    {
+        g_htfData[index].breakoutUp = true;
+        g_htfData[index].breakLevel = g_htfData[index].high;
+        g_htfData[index].confirmationCandles = 0;
+        PrintFormat("%s: BREAKOUT ABOVE HTF High %.5f", symbol, g_htfData[index].high);
+        return true;
+    }
+    
+    if(currentPrice < g_htfData[index].low && !g_htfData[index].breakoutDown)
+    {
+        g_htfData[index].breakoutDown = true;
+        g_htfData[index].breakLevel = g_htfData[index].low;
+        g_htfData[index].confirmationCandles = 0;
+        PrintFormat("%s: BREAKOUT BELOW HTF Low %.5f", symbol, g_htfData[index].low);
+        return true;
+    }
+    
+    return g_htfData[index].breakoutUp || g_htfData[index].breakoutDown;
+}
+
+//+------------------------------------------------------------------+
+//| Check Entry Confirmation                                         |
+//+------------------------------------------------------------------+
+bool CheckEntryConfirmation(const string symbol, const int index)
+{
+    if(UseTwoCandles)
+    {
+        if(CheckTwoCandlesConfirmation(symbol, index))
+        {
+            PrintFormat("%s: Two candles confirmation passed", symbol);
+            return true;
+        }
+    }
+    
+    if(UseCandlePatterns)
+    {
+        if(CheckCandlePatternConfirmation(symbol, index))
+        {
+            PrintFormat("%s: Candle pattern confirmation passed", symbol);
+            return true;
+        }
+    }
+    
+    if(!UseTwoCandles && !UseCandlePatterns)
+    {
+        return true;
+    }
+    
+    return false;
+}
+
+//+------------------------------------------------------------------+
+//| Check Two Candles Confirmation                                   |
+//+------------------------------------------------------------------+
+bool CheckTwoCandlesConfirmation(const string symbol, const int index)
+{
+    double close[];
+    if(CopyClose(symbol, LTF_Period, 1, 2, close) < 2)
+        return false;
+    
+    double close1 = close[1];
+    double close2 = close[0];
+    
+    if(g_htfData[index].breakoutUp)
+    {
+        return (close1 > g_htfData[index].breakLevel && close2 > g_htfData[index].breakLevel);
+    }
+    else if(g_htfData[index].breakoutDown)
+    {
+        return (close1 < g_htfData[index].breakLevel && close2 < g_htfData[index].breakLevel);
+    }
+    
+    return false;
+}
+
+//+------------------------------------------------------------------+
+//| Check Candle Pattern Confirmation                                |
+//+------------------------------------------------------------------+
+bool CheckCandlePatternConfirmation(const string symbol, const int index)
+{
+    double open[], close[], high[], low[];
+    
+    if(CopyOpen(symbol, LTF_Period, 1, 2, open) < 2 ||
+       CopyClose(symbol, LTF_Period, 1, 2, close) < 2 ||
+       CopyHigh(symbol, LTF_Period, 1, 2, high) < 2 ||
+       CopyLow(symbol, LTF_Period, 1, 2, low) < 2)
+    {
+        return false;
+    }
+    
+    double open1 = open[1], close1 = close[1], high1 = high[1], low1 = low[1];
+    double open2 = open[0], close2 = close[0], high2 = high[0], low2 = low[0];
+    
+    double body1 = MathAbs(close1 - open1);
+    double body2 = MathAbs(close2 - open2);
+    double range1 = high1 - low1;
+    double range2 = high2 - low2;
+    
+    if(range1 == 0 || range2 == 0)
+        return false;
+    
+    if(g_htfData[index].breakoutUp)
+    {
+        if(close1 > open1 && close2 < open2 && 
+           close1 > open2 && open1 < close2 &&
+           body1 > body2 * 1.2 &&
+           body1/range1 > MinCandleBodyRatio)
+        {
+            return true;
+        }
+        
+        double lowerWick1 = MathMin(open1, close1) - low1;
+        if(close1 > open1 && lowerWick1 > body1 * 2 && body1/range1 > MinCandleBodyRatio)
+        {
+            return true;
+        }
+    }
+    else if(g_htfData[index].breakoutDown)
+    {
+        if(close1 < open1 && close2 > open2 && 
+           close1 < open2 && open1 > close2 &&
+           body1 > body2 * 1.2 &&
+           body1/range1 > MinCandleBodyRatio)
+        {
+            return true;
+        }
+        
+        double upperWick1 = high1 - MathMax(open1, close1);
+        if(close1 < open1 && upperWick1 > body1 * 2 && body1/range1 > MinCandleBodyRatio)
+        {
+            return true;
+        }
+    }
+    
+    return false;
+}
+
+//+------------------------------------------------------------------+
+//| Execute Breakout Trade                                           |
+//+------------------------------------------------------------------+
+bool ExecuteBreakoutTrade(const string symbol, const int index)
+{
+    if(!g_eaSymbolInfo.Name(symbol))
+    {
+        PrintFormat("ERROR: Cannot select symbol %s", symbol);
+        return false;
+    }
+    
+    g_eaSymbolInfo.RefreshRates();
+    
+    double atr = GetATRValue(index);
+    if(atr <= 0)
+    {
+        PrintFormat("ERROR: Invalid ATR value for %s", symbol);
+        return false;
+    }
+    
+    double lotSize = CalculateLotSize(symbol, index, atr);
+    if(lotSize < g_eaSymbolInfo.LotsMin())
+    {
+        PrintFormat("ERROR: Lot size %.2f below minimum", lotSize);
+        return false;
+    }
+    
+    double price, sl, tp;
+    ENUM_ORDER_TYPE orderType;
+    string direction;
+    
+    if(g_htfData[index].breakoutUp)
+    {
+        orderType = ORDER_TYPE_BUY;
+        direction = "BUY";
+        price = g_eaSymbolInfo.Ask();
+        sl = NormalizeDouble(price - (atr * ATRStopLoss), g_eaSymbolInfo.Digits());
+        tp = NormalizeDouble(price + (atr * ATRTakeProfit), g_eaSymbolInfo.Digits());
+    }
+    else if(g_htfData[index].breakoutDown)
+    {
+        orderType = ORDER_TYPE_SELL;
+        direction = "SELL";
+        price = g_eaSymbolInfo.Bid();
+        sl = NormalizeDouble(price + (atr * ATRStopLoss), g_eaSymbolInfo.Digits());
+        tp = NormalizeDouble(price - (atr * ATRTakeProfit), g_eaSymbolInfo.Digits());
+    }
+    else
+    {
+        return false;
+    }
+    
+    double riskDistance = MathAbs(price - sl);
+    double rewardDistance = MathAbs(tp - price);
+    double rrRatio = rewardDistance / riskDistance;
+    
+    if(rrRatio < MinRiskReward)
+    {
+        PrintFormat("%s: R:R ratio %.2f below minimum", symbol, rrRatio);
+        return false;
+    }
+    
+    bool result = g_eaTrade.PositionOpen(symbol, orderType, lotSize, price, sl, tp, 
+                                        StringFormat("Breakout_%s", direction));
+    
+    if(result && g_eaTrade.ResultRetcode() == TRADE_RETCODE_DONE)
+    {
+        PrintFormat("%s %s OPENED | Lot:%.2f | Price:%.5f | SL:%.5f | TP:%.5f | RR:%.2f",
+                   symbol, direction, lotSize, price, sl, tp, rrRatio);
+        
+        g_stats[index].totalTrades++;
+        return true;
+    }
+    else
+    {
+        PrintFormat("%s: Trade failed | Error:%d", symbol, g_eaTrade.ResultRetcode());
+        return false;
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Calculate Lot Size                                               |
+//+------------------------------------------------------------------+
+double CalculateLotSize(const string symbol, const int index, const double atr)
+{
+    if(!g_eaSymbolInfo.Name(symbol) || atr <= 0)
+        return g_eaSymbolInfo.LotsMin();
+    
+    double accountBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+    double riskAmount = (RiskPercent / 100.0) * accountBalance;
+    
+    double stopLossDistance = atr * ATRStopLoss;
+    double tickValue = g_eaSymbolInfo.TickValue();
+    double tickSize = g_eaSymbolInfo.TickSize();
+    
+    if(tickValue <= 0 || tickSize <= 0 || stopLossDistance <= 0)
+        return g_eaSymbolInfo.LotsMin();
+    
+    double stopLossInTicks = stopLossDistance / tickSize;
+    double lotSize = riskAmount / (stopLossInTicks * tickValue);
+    
+    double minLot = g_eaSymbolInfo.LotsMin();
+    double maxLot = g_eaSymbolInfo.LotsMax();
+    double lotStep = g_eaSymbolInfo.LotsStep();
+    
+    lotSize = MathMax(minLot, MathMin(lotSize, maxLot));
+    lotSize = NormalizeDouble(MathFloor(lotSize / lotStep) * lotStep, 2);
+    
+    return lotSize;
+}
+
+//+------------------------------------------------------------------+
