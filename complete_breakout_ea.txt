@@ -23,7 +23,7 @@
 //+------------------------------------------------------------------+
 sinput string            GENERAL_PARAMS        = "=== General Settings ===";
 input ENUM_TIMEFRAMES    HTF_Period            = PERIOD_D1;        // Higher TimeFrame
-input ENUM_TIMEFRAMES    LTF_Period            = PERIOD_H1;        // Lower TimeFrame
+input ENUM_TIMEFRAMES    LTF_Period            = PERIOD_M15;        // Lower TimeFrame
 input string             Symbol1               = "EURUSD";         // Symbol 1
 input string             Symbol2               = "GBPUSD";         // Symbol 2
 input string             Symbol3               = "USDJPY";         // Symbol 3
@@ -31,16 +31,16 @@ input int                MagicNumber           = 234567;           // Magic Numb
 
 sinput string            RISK_PARAMS           = "=== Risk Management ===";
 input double             RiskPercent           = 1.0;              // Risk per trade (%)
-input int                MaxOpenPositions      = 2;                // Max open positions per symbol
+input int                MaxOpenPositions      = 3;                // Max open positions per symbol
 input int                MaxTotalPositions     = 6;                // Max total positions
 input int                MaxConsecutiveLosses  = 3;                // Max consecutive losses before pause
 input double             MinRiskReward         = 1.5;              // Minimum Risk:Reward ratio
 input double             MaxSpreadPips         = 3.0;              // Maximum spread in pips
 
 sinput string            ADV_RISK_PARAMS       = "=== Advanced Risk Management (Optional) ===";
-input bool               UseAdvancedRisk       = false;            // Enable Dynamic Risk Management
+input bool               UseAdvancedRisk       = true;            // Enable Dynamic Risk Management
 input bool               UseDrawdownDefense    = true;             // Enable Drawdown Defense Protocol
-input double             DrawdownThreshold     = 5.0;              // Drawdown % to trigger risk reduction
+input double             DrawdownThreshold     = 3.0;              // Drawdown % to trigger risk reduction
 input double             DrawdownRiskMultiplier = 0.5;             // Risk multiplier in drawdown (0.5 = half)
 input bool               UseProfitAccelerator  = true;             // Enable Profit Accelerator Rule
 input double             ProfitThreshold       = 3.0;              // Profit % to trigger risk increase
@@ -50,7 +50,7 @@ input double             MaxRiskPercent        = 3.0;              // Maximum ri
 sinput string            TRAILING_PARAMS       = "=== Trailing Stop Settings ===";
 input double             BEMultiplier          = 1.5;              // Break-even trigger (ATR multiplier)
 input double             TrailStartMultiplier  = 2.0;              // Trail start (ATR multiplier)
-input double             TrailStopMultiplier   = 1.0;              // Trail distance (ATR multiplier)
+input double             TrailStopMultiplier   = 0.75;              // Trail distance (ATR multiplier)
 
 sinput string            TRADING_PARAMS        = "=== Trading Parameters ===";
 input int                ATRPeriod             = 14;               // ATR Period
