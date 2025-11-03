@@ -1,0 +1,172 @@
+//+------------------------------------------------------------------+
+//| Manage Positions - Enhanced with Manual TP Close                |
+//| For: BreakoutEA.mq5                                              |
+//| Replace the existing ManagePositions() function with this        |
+//+------------------------------------------------------------------+
+void ManagePositions(const string symbol, const int index)
+{
+    double atr = GetATRValue(index);
+    if(atr <= 0)
+        return;
+    
+    for(int i = PositionsTotal() - 1; i >= 0; i--)
+    {
+        if(!g_eaPosition.SelectByIndex(i))
+            continue;
+        
+        if(g_eaPosition.Symbol() != symbol || g_eaPosition.Magic() != MagicNumber)
+            continue;
+        
+        if(!g_eaSymbolInfo.Name(symbol))
+            continue;
+        
+        g_eaSymbolInfo.RefreshRates();
+        
+        double currentSL = g_eaPosition.StopLoss();
+        double currentTP = g_eaPosition.TakeProfit();
+        double openPrice = g_eaPosition.PriceOpen();
+        int digits = (int)g_eaSymbolInfo.Digits();
+        
+        //+------------------------------------------------------------------+
+        //| MANUAL TP CLOSE CHECK - PRIORITY #1                              |
+        //+------------------------------------------------------------------+
+        if(currentTP > 0)  // Only if TP is set
+        {
+            bool closeAtTP = false;
+            double tpBuffer = g_eaSymbolInfo.Point() * 3;  // 3 points buffer (0.3 pips)
+            
+            if(g_eaPosition.PositionType() == POSITION_TYPE_BUY)
+            {
+                double bid = g_eaSymbolInfo.Bid();
+                
+                // Close if bid >= TP (accounting for spread/slippage)
+                if(bid >= (currentTP - tpBuffer))
+                {
+                    closeAtTP = true;
+                    double pipsToTP = (currentTP - bid) / g_eaSymbolInfo.Point() / 10;
+                    PrintFormat("%s BUY: Manual TP close triggered at %.5f (TP: %.5f, Distance: %.1f pips)", 
+                               symbol, bid, currentTP, pipsToTP);
+                }
+            }
+            else if(g_eaPosition.PositionType() == POSITION_TYPE_SELL)
+            {
+                double ask = g_eaSymbolInfo.Ask();
+                
+                // Close if ask <= TP (accounting for spread/slippage)
+                if(ask <= (currentTP + tpBuffer))
+                {
+                    closeAtTP = true;
+                    double pipsToTP = (ask - currentTP) / g_eaSymbolInfo.Point() / 10;
+                    PrintFormat("%s SELL: Manual TP close triggered at %.5f (TP: %.5f, Distance: %.1f pips)", 
+                               symbol, ask, currentTP, pipsToTP);
+                }
+            }
+            
+            // Execute manual close at TP
+            if(closeAtTP)
+            {
+                ulong ticket = g_eaPosition.Ticket();
+                double profit = g_eaPosition.Profit() + g_eaPosition.Swap() + g_eaPosition.Commission();
+                
+                if(g_eaTrade.PositionClose(ticket))
+                {
+                    if(g_eaTrade.ResultRetcode() == TRADE_RETCODE_DONE)
+                    {
+                        PrintFormat("✅ %s: Position #%I64u closed manually at TP | Profit: $%.2f", 
+                                   symbol, ticket, profit);
+                    }
+                    else
+                    {
+                        PrintFormat("⚠️ %s: TP close attempt for #%I64u - Retcode: %d (%s)", 
+                                   symbol, ticket, g_eaTrade.ResultRetcode(), 
+                                   g_eaTrade.ResultRetcodeDescription());
+                    }
+                }
+                else
+                {
+                    PrintFormat("❌ %s: Failed to close #%I64u at TP | Error: %d", 
+                               symbol, ticket, GetLastError());
+                }
+                
+                // Skip trailing stop logic for this position since we tried to close it
+                continue;
+            }
+        }
+        //+------------------------------------------------------------------+
+        //| END OF MANUAL TP CLOSE SECTION                                   |
+        //+------------------------------------------------------------------+
+        
+        // Continue with existing trailing stop logic
+        bool modified = false;
+        double newSL = 0.0;
+        
+        if(g_eaPosition.PositionType() == POSITION_TYPE_BUY)
+        {
+            double bid = g_eaSymbolInfo.Bid();
+            double profitDistance = bid - openPrice;
+            
+            // Break-even trigger
+            if(profitDistance >= (atr * BEMultiplier) && currentSL < openPrice)
+            {
+                newSL = NormalizeDouble(openPrice + (g_eaSymbolInfo.Point() * 10), digits);
+                modified = true;
+                PrintFormat("%s BUY: Moving to Break-Even at %.5f", symbol, newSL);
+            }
+            // Trailing stop trigger
+            else if(profitDistance >= (atr * TrailStartMultiplier) && currentSL >= openPrice)
+            {
+                double trailSL = NormalizeDouble(bid - (atr * TrailStopMultiplier), digits);
+                if(trailSL > currentSL)
+                {
+                    newSL = trailSL;
+                    modified = true;
+                    PrintFormat("%s BUY: Trailing SL to %.5f", symbol, newSL);
+                }
+            }
+        }
+        else if(g_eaPosition.PositionType() == POSITION_TYPE_SELL)
+        {
+            double ask = g_eaSymbolInfo.Ask();
+            double profitDistance = openPrice - ask;
+            
+            // Break-even trigger
+            if(profitDistance >= (atr * BEMultiplier) && (currentSL == 0 || currentSL > openPrice))
+            {
+                newSL = NormalizeDouble(openPrice - (g_eaSymbolInfo.Point() * 10), digits);
+                modified = true;
+                PrintFormat("%s SELL: Moving to Break-Even at %.5f", symbol, newSL);
+            }
+            // Trailing stop trigger
+            else if(profitDistance >= (atr * TrailStartMultiplier) && currentSL > 0 && currentSL <= openPrice)
+            {
+                double trailSL = NormalizeDouble(ask + (atr * TrailStopMultiplier), digits);
+                if(currentSL == 0 || trailSL < currentSL)
+                {
+                    newSL = trailSL;
+                    modified = true;
+                    PrintFormat("%s SELL: Trailing SL to %.5f", symbol, newSL);
+                }
+            }
+        }
+        
+        // Modify stop loss if needed
+        if(modified && newSL > 0)
+        {
+            if(g_eaTrade.PositionModify(g_eaPosition.Ticket(), newSL, g_eaPosition.TakeProfit()))
+            {
+                if(g_eaTrade.ResultRetcode() == TRADE_RETCODE_DONE)
+                {
+                    PrintFormat("%s: SL modified successfully to %.5f", symbol, newSL);
+                }
+                else
+                {
+                    PrintFormat("%s: SL modify returned code %d", symbol, g_eaTrade.ResultRetcode());
+                }
+            }
+            else
+            {
+                PrintFormat("%s: Failed to modify SL | Error:%d", symbol, g_eaTrade.ResultRetcode());
+            }
+        }
+    }
+}
