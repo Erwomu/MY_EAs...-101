@@ -95,7 +95,76 @@ void ManagePositions(const string symbol, const int index)
         //+------------------------------------------------------------------+
         //| END OF MANUAL TP CLOSE SECTION                                   |
         //+------------------------------------------------------------------+
-        
+
+       //+------------------------------------------------------------------+
+        //| MANUAL SL CLOSE CHECK - PRIORITY #2                              |
+        //+------------------------------------------------------------------+
+        if(currentSL > 0)  // Only if SL is set
+        {
+            bool closeAtSL = false;
+            double slBuffer = g_eaSymbolInfo.Point() * 3;  // 3 points buffer (0.3 pips)
+            
+            if(g_eaPosition.PositionType() == POSITION_TYPE_BUY)
+            {
+                double bid = g_eaSymbolInfo.Bid();
+                
+                // Close if bid <= SL (price hit stop loss)
+                if(bid <= (currentSL + slBuffer))
+                {
+                    closeAtSL = true;
+                    double pipsFromSL = (bid - currentSL) / g_eaSymbolInfo.Point() / 10;
+                    PrintFormat("%s BUY: Manual SL close triggered at %.5f (SL: %.5f, Distance: %.1f pips)", 
+                               symbol, bid, currentSL, pipsFromSL);
+                }
+            }
+            else if(g_eaPosition.PositionType() == POSITION_TYPE_SELL)
+            {
+                double ask = g_eaSymbolInfo.Ask();
+                
+                // Close if ask >= SL (price hit stop loss)
+                if(ask >= (currentSL - slBuffer))
+                {
+                    closeAtSL = true;
+                    double pipsFromSL = (currentSL - ask) / g_eaSymbolInfo.Point() / 10;
+                    PrintFormat("%s SELL: Manual SL close triggered at %.5f (SL: %.5f, Distance: %.1f pips)", 
+                               symbol, ask, currentSL, pipsFromSL);
+                }
+            }
+            
+            // Execute manual close at SL
+            if(closeAtSL)
+            {
+                ulong ticket = g_eaPosition.Ticket();
+                double profit = g_eaPosition.Profit() + g_eaPosition.Swap() + g_eaPosition.Commission();
+                
+                if(g_eaTrade.PositionClose(ticket))
+                {
+                    if(g_eaTrade.ResultRetcode() == TRADE_RETCODE_DONE)
+                    {
+                        PrintFormat("🛑 %s: Position #%I64u closed manually at SL | Loss: $%.2f", 
+                                   symbol, ticket, profit);
+                    }
+                    else
+                    {
+                        PrintFormat("⚠️ %s: SL close attempt for #%I64u - Retcode: %d (%s)", 
+                                   symbol, ticket, g_eaTrade.ResultRetcode(), 
+                                   g_eaTrade.ResultRetcodeDescription());
+                    }
+                }
+                else
+                {
+                    PrintFormat("❌ %s: Failed to close #%I64u at SL | Error: %d", 
+                               symbol, ticket, GetLastError());
+                }
+                
+                // Skip trailing stop logic for this position since we closed it
+                continue;
+            }
+        }
+        //+------------------------------------------------------------------+
+        //| END OF MANUAL SL CLOSE SECTION                                   |
+        //+------------------------------------------------------------------+
+
         // Continue with existing trailing stop logic
         bool modified = false;
         double newSL = 0.0;
