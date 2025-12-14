@@ -1,0 +1,766 @@
+//+------------------------------------------------------------------+
+//|                                              L'ACTION DE PRIX.mq5 |
+//|                                  Copyright 2025, MetaQuotes Ltd. |
+//|                                             https://www.mql5.com |
+//+------------------------------------------------------------------+
+#property copyright "Copyright 2025, MetaQuotes Ltd."
+#property link      "https://www.mql5.com"
+#property version   "3.01"
+#property description "Multi-Symbol Price Action Trading System - Production Ready"
+#property description "Integrated with PriceAction.mqh Library"
+#property description "Enhanced with Array Bounds Protection"
+
+//+------------------------------------------------------------------+
+//| Include Directives                                               |
+//+------------------------------------------------------------------+
+#include <Trade\Trade.mqh>
+#include <Trade\SymbolInfo.mqh>
+#include <Trade\PositionInfo.mqh>
+#include <PriceAction.mqh>
+
+//+------------------------------------------------------------------+
+//| EA-Specific Input Parameters                                     |
+//+------------------------------------------------------------------+
+sinput string            SEP1                = "=== Point of Interest ===";
+input bool               UsePivotPoint      = true;           // Use Pivot Point as key level
+input bool               UseVWAP            = false;          // Use VWAP as key level
+input ENUM_TIMEFRAMES    KeyLevelTimeframe  = PERIOD_D1;      // Timeframe for key level calculation
+
+sinput string            SEP2                = "=== Position Limits ===";
+input int                MaxPositionsPerSymbol = 1;           // Max positions per symbol
+input int                MaxTotalPositions  = 3;              // Max total positions across all symbols
+
+sinput string            SEP3                = "=== Pattern Requirements ===";
+input bool               RequireRejectionPattern = true;      // Require price rejection pattern
+input double             KeyLevelTolerance  = 5.0;           // Key level proximity (pips)
+
+sinput string            SEP4                = "=== Trading Cooldown ===";
+input int                MinutesBetweenTrades = 5;            // Minimum minutes between trades per symbol
+
+//+------------------------------------------------------------------+
+//| Symbol Configuration Structure                                    |
+//+------------------------------------------------------------------+
+struct SymbolConfig
+{
+    string   symbol;
+    double   multiplier;
+    double   maxSpread;
+    bool     isActive;
+    
+    // Trading state
+    double   pivotPoint;
+    double   vwap;
+    double   keyLevel;
+    double   pointOfInterest;
+    bool     hasPosition;
+    datetime lastTradeTime;
+};
+
+//+------------------------------------------------------------------+
+//| Global Variables                                                  |
+//+------------------------------------------------------------------+
+SymbolConfig    g_symbols[];
+int             g_symbolCount = 0;
+CTrade          g_trade;
+CSymbolInfo     g_symbolInfo;
+CPositionInfo   g_positionInfo;
+int             g_totalPositions = 0;
+
+//+------------------------------------------------------------------+
+//| Expert Initialization Function - PRODUCTION READY                |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+    Print("========================================");
+    Print("Starting EA Initialization...");
+    Print("========================================");
+    
+    // STEP 1: Initialize PriceAction library
+    Print("Step 1: Initializing PriceAction library...");
+    if(!InitializePriceAction())
+    {
+        Print("ERROR: Failed to initialize PriceAction library");
+        return INIT_FAILED;
+    }
+    Print("✓ PriceAction library initialized");
+    
+    // STEP 2: Configure symbols
+    Print("Step 2: Configuring symbols...");
+    if(!ConfigureSymbols())
+    {
+        Print("ERROR: Failed to configure symbols");
+        return INIT_FAILED;
+    }
+    Print("✓ Symbols configured");
+    
+    // STEP 3: Pre-load symbols and historical data
+    Print("Step 3: Pre-loading symbols and historical data...");
+    for(int i = 0; i < g_symbolCount; i++)
+    {
+        string symbol = g_symbols[i].symbol;
+        
+        PrintFormat("  [%d/%d] Loading %s...", i+1, g_symbolCount, symbol);
+        
+        // Add symbol to Market Watch
+        if(!SymbolSelect(symbol, true))
+        {
+            PrintFormat("    ⚠️ Adding %s to Market Watch...", symbol);
+            SymbolSelect(symbol, true);
+        }
+        
+        // Force load historical data by accessing bars
+        int bars = Bars(symbol, ATRTimeframe);
+        
+        if(bars < ATRPeriod + 10)
+        {
+            PrintFormat("    ⚠️ Loading historical data for %s (current: %d bars)...", symbol, bars);
+            
+            // Trigger data loading
+            datetime time = iTime(symbol, ATRTimeframe, ATRPeriod + 20);
+            double high = iHigh(symbol, ATRTimeframe, 10);
+            double low = iLow(symbol, ATRTimeframe, 10);
+            
+            Sleep(200);
+            
+            bars = Bars(symbol, ATRTimeframe);
+            PrintFormat("    → Now have %d bars for %s", bars, symbol);
+        }
+        else
+        {
+            PrintFormat("    ✓ %s has sufficient data (%d bars)", symbol, bars);
+        }
+    }
+    
+    Print("✓ Historical data loaded for all symbols");
+    
+    // CRITICAL PAUSE: Let data settle
+    Print("⏳ Pausing 1 second to ensure data is ready...");
+    Sleep(1000);
+    
+    // STEP 4: Initialize symbols in PriceAction library
+    Print("Step 4: Initializing symbols in PriceAction library...");
+    int activeCount = 0;
+    
+    for(int i = 0; i < g_symbolCount; i++)
+    {
+        PrintFormat("  [%d/%d] Initializing %s in library...", i+1, g_symbolCount, g_symbols[i].symbol);
+        
+        if(InitializeSymbol(g_symbols[i].symbol, g_symbols[i].multiplier, g_symbols[i].maxSpread))
+        {
+            g_symbols[i].isActive = true;
+            activeCount++;
+            PrintFormat("    ✓ %s initialized in library", g_symbols[i].symbol);
+        }
+        else
+        {
+            PrintFormat("    ❌ Failed to initialize %s", g_symbols[i].symbol);
+            g_symbols[i].isActive = false;
+        }
+    }
+    
+    if(activeCount == 0)
+    {
+        Print("========================================");
+        Print("ERROR: No symbols initialized in library");
+        Print("========================================");
+        return INIT_FAILED;
+    }
+    
+    PrintFormat("✓ Symbols initialized: %d / %d", activeCount, g_symbolCount);
+    
+    // CRITICAL PAUSE: Ensure library symbols array is populated
+    Print("⏳ Pausing 500ms before creating ATR handles...");
+    Sleep(500);
+    
+    // STEP 5: Create ATR handles
+    Print("Step 5: Creating ATR indicator handles...");
+    Print("========================================");
+    
+    if(!InitializeATRHandles())
+    {
+        Print("========================================");
+        Print("WARNING: ATR initialization had issues");
+        Print("EA will attempt to recreate handles during runtime");
+        Print("========================================");
+    }
+    else
+    {
+        Print("========================================");
+        Print("✓ All ATR handles created successfully");
+        Print("========================================");
+    }
+    
+    // STEP 6: Set up trading parameters
+    Print("Step 6: Configuring trading parameters...");
+    g_trade.SetExpertMagicNumber(123456);
+    g_trade.SetDeviationInPoints(10);
+    g_trade.SetTypeFilling(ORDER_FILLING_IOC);
+    Print("✓ Trading parameters configured");
+    
+    // STEP 7: Start timer
+    Print("Step 7: Starting timer...");
+    EventSetTimer(30);
+    Print("✓ Timer started (30 seconds)");
+    
+    // Final summary
+    Print("========================================");
+    Print("✓ L'ACTION DE PRIX EA v3.01 READY");
+    Print("========================================");
+    PrintFormat("  Active Symbols: %d / %d", activeCount, g_symbolCount);
+    PrintFormat("  Risk Per Trade: %.2f%%", RiskPercentage);
+    PrintFormat("  Risk:Reward: %.1f:1", RiskRewardRatio);
+    PrintFormat("  Pattern Detection: %s", RequireRejectionPattern ? "Required" : "Optional");
+    PrintFormat("  News Filter: %s", UseNewsFilter ? "Enabled" : "Disabled");
+    PrintFormat("  Time Filter: %s", UseTimeFilter ? "Enabled" : "Disabled");
+    Print("========================================");
+    Print("Waiting for first tick...");
+    Print("========================================");
+    
+    return INIT_SUCCEEDED;
+}
+
+//+------------------------------------------------------------------+
+//| Expert Deinitialization Function                                  |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+    // Release ATR handles
+    ReleaseATRHandles();
+    
+    // Clean up PriceAction library
+    DeinitializePriceAction();
+    
+    // Kill timer
+    EventKillTimer();
+    
+    // Log deinitialization reason
+    string reasonText = GetDeinitReasonText(reason);
+    PrintFormat("EA Deinitialized: %s", reasonText);
+}
+
+//+------------------------------------------------------------------+
+//| Timer Event Function - WITH BOUNDS CHECKING                      |
+//+------------------------------------------------------------------+
+void OnTimer()
+{
+    CheckNewsImpact();
+    ProcessAllSymbols();
+    
+    // Validate symbol count
+    if(g_symbolCount <= 0 || g_symbolCount > ArraySize(g_symbols))
+    {
+        PrintFormat("ERROR: Invalid g_symbolCount: %d (array size: %d)", 
+                   g_symbolCount, ArraySize(g_symbols));
+        return;
+    }
+    
+    // Update key levels with bounds checking
+    for(int i = 0; i < g_symbolCount; i++)
+    {
+        // Validate index before processing
+        if(i < 0 || i >= ArraySize(g_symbols))
+        {
+            PrintFormat("ERROR: Invalid array access in OnTimer, index: %d, array size: %d", 
+                       i, ArraySize(g_symbols));
+            break;
+        }
+        
+        if(!g_symbols[i].isActive)
+            continue;
+            
+        CalculateKeyLevels(i);
+        CalculatePointOfInterest(i);
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Tick Event Function - WITH BOUNDS CHECKING                       |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+    // Update total positions count
+    g_totalPositions = GetActivePositionsCount();
+    
+    // Check if max total positions reached
+    if(g_totalPositions >= MaxTotalPositions)
+        return;
+    
+    // Validate g_symbolCount
+    if(g_symbolCount <= 0 || g_symbolCount > ArraySize(g_symbols))
+    {
+        PrintFormat("ERROR: Invalid g_symbolCount: %d (array size: %d)", 
+                   g_symbolCount, ArraySize(g_symbols));
+        return;
+    }
+    
+    // Process each symbol
+    for(int i = 0; i < g_symbolCount; i++)
+    {
+        // Validate index before each operation
+        if(i < 0 || i >= ArraySize(g_symbols))
+        {
+            PrintFormat("ERROR: Invalid array access in OnTick, index: %d", i);
+            break;
+        }
+        
+        if(!g_symbols[i].isActive)
+            continue;
+            
+        string symbol = g_symbols[i].symbol;
+        
+        // Validate symbol
+        if(symbol == "" || symbol == NULL)
+        {
+            PrintFormat("ERROR: Empty symbol at index %d", i);
+            continue;
+        }
+        
+        // Check position status
+        int posCount = GetActivePositionsCount(symbol);
+        g_symbols[i].hasPosition = (posCount >= MaxPositionsPerSymbol);
+        
+        if(g_symbols[i].hasPosition)
+        {
+            // Manage existing positions
+            ModifyTrade(symbol);
+            continue;
+        }
+        
+        // Calculate Point of Interest before ProcessSymbol
+        CalculateKeyLevels(i);
+        CalculatePointOfInterest(i);
+        
+        // Process symbol with Point of Interest
+        ProcessSymbol(symbol, g_symbols[i].pointOfInterest);
+        
+        // Check if trading is allowed
+        if(!IsTradingAllowed(symbol))
+            continue;
+            
+        // Check cooldown period
+        if(!CheckTradeCooldown(i))
+            continue;
+            
+        // Get trading signal from library
+        int signal = GetTradingSignal(symbol);
+        
+        if(signal == 0)
+            continue;
+            
+        // Additional validation with key levels
+        if(!ValidateSignalWithKeyLevel(i, signal))
+            continue;
+            
+        // Execute trade
+        if(ExecuteTrade(symbol, signal))
+        {
+            g_symbols[i].lastTradeTime = TimeCurrent();
+            g_totalPositions++;
+        }
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Configure Trading Symbols                                        |
+//+------------------------------------------------------------------+
+bool ConfigureSymbols()
+{
+    // Define symbols to trade
+    string symbols[] = {"EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD", "NZDUSD"};
+    double multipliers[] = {10000, 10000, 100, 10000, 10000, 10000};
+    double maxSpreads[] = {0.00030, 0.00035, 0.040, 0.00030, 0.00030, 0.00035};
+    
+    g_symbolCount = ArraySize(symbols);
+    
+    if(g_symbolCount == 0)
+    {
+        Print("ERROR: No symbols defined");
+        return false;
+    }
+    
+    ArrayResize(g_symbols, g_symbolCount);
+    
+    for(int i = 0; i < g_symbolCount; i++)
+    {
+        g_symbols[i].symbol = symbols[i];
+        g_symbols[i].multiplier = multipliers[i];
+        g_symbols[i].maxSpread = maxSpreads[i];
+        g_symbols[i].isActive = false;
+        g_symbols[i].pivotPoint = 0.0;
+        g_symbols[i].vwap = 0.0;
+        g_symbols[i].keyLevel = 0.0;
+        g_symbols[i].pointOfInterest = 0.0;
+        g_symbols[i].hasPosition = false;
+        g_symbols[i].lastTradeTime = 0;
+    }
+    
+    return true;
+}
+
+//+------------------------------------------------------------------+
+//| Calculate Key Levels (Pivot/VWAP) - WITH BOUNDS CHECKING        |
+//+------------------------------------------------------------------+
+void CalculateKeyLevels(int index)
+{
+    // CRITICAL: Validate index is within bounds
+    if(index < 0 || index >= g_symbolCount || index >= ArraySize(g_symbols))
+    {
+        PrintFormat("ERROR: Invalid index %d in CalculateKeyLevels (g_symbolCount: %d, array size: %d)", 
+                   index, g_symbolCount, ArraySize(g_symbols));
+        return;
+    }
+    
+    string symbol = g_symbols[index].symbol;
+    
+    // Validate symbol string
+    if(symbol == "" || symbol == NULL)
+    {
+        PrintFormat("ERROR: Empty symbol at index %d", index);
+        return;
+    }
+    
+    // Get previous period data
+    double high = iHigh(symbol, KeyLevelTimeframe, 1);
+    double low = iLow(symbol, KeyLevelTimeframe, 1);
+    double close = iClose(symbol, KeyLevelTimeframe, 1);
+    double open = iOpen(symbol, KeyLevelTimeframe, 1);
+    
+    if(high <= 0 || low <= 0 || close <= 0 || open <= 0)
+    {
+        LogDebug(StringFormat("%s: Failed to retrieve price data for key level calculation", symbol));
+        return;
+    }
+    
+    // Calculate Pivot Point (Standard formula)
+    g_symbols[index].pivotPoint = (high + low + close) / 3.0;
+    
+    // Calculate VWAP approximation
+    g_symbols[index].vwap = (high + low + close + open) / 4.0;
+    
+    // Set key level based on user preference
+    if(UsePivotPoint && UseVWAP)
+    {
+        g_symbols[index].keyLevel = (g_symbols[index].pivotPoint + g_symbols[index].vwap) / 2.0;
+    }
+    else if(UsePivotPoint)
+    {
+        g_symbols[index].keyLevel = g_symbols[index].pivotPoint;
+    }
+    else if(UseVWAP)
+    {
+        g_symbols[index].keyLevel = g_symbols[index].vwap;
+    }
+    else
+    {
+        g_symbols[index].keyLevel = g_symbols[index].pivotPoint;
+    }
+    
+    // Draw key level on chart (only for current symbol)
+    if(symbol == _Symbol)
+    {
+        string lineName = "KeyLevel_" + symbol;
+        ObjectDelete(0, lineName);
+        
+        if(g_symbols[index].keyLevel > 0)
+        {
+            ObjectCreate(0, lineName, OBJ_HLINE, 0, 0, g_symbols[index].keyLevel);
+            ObjectSetInteger(0, lineName, OBJPROP_COLOR, clrDodgerBlue);
+            ObjectSetInteger(0, lineName, OBJPROP_STYLE, STYLE_DASHDOTDOT);
+            ObjectSetInteger(0, lineName, OBJPROP_WIDTH, 2);
+            ObjectSetString(0, lineName, OBJPROP_TEXT, "Key Level");
+        }
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Find Fibonacci Level Nearest to Key Level - WITH BOUNDS CHECK   |
+//+------------------------------------------------------------------+
+double FindNearestFibToKeyLevel(int index)
+{
+    // CRITICAL: Validate index
+    if(index < 0 || index >= g_symbolCount || index >= ArraySize(g_symbols))
+    {
+        PrintFormat("ERROR: Invalid index %d in FindNearestFibToKeyLevel", index);
+        return 0.0;
+    }
+    
+    string symbol = g_symbols[index].symbol;
+    double keyLevel = g_symbols[index].keyLevel;
+    
+    if(keyLevel <= 0)
+    {
+        LogDebug(StringFormat("%s: Invalid key level for Fibonacci matching", symbol));
+        return 0.0;
+    }
+    
+    // Get symbol index in library
+    int symIndex = GetSymbolIndex(symbol);
+    if(symIndex < 0)
+    {
+        LogDebug(StringFormat("%s: Symbol not found in library", symbol));
+        return 0.0;
+    }
+    
+    // Validate library index
+    if(symIndex >= MAX_SYMBOLS)
+    {
+        LogDebug(StringFormat("%s: Invalid library index %d", symbol, symIndex));
+        return 0.0;
+    }
+    
+    // Get Fibonacci data from library
+    FibonacciData fibData = g_symbolData[symIndex].fibData;
+    
+    if(!fibData.isValid)
+    {
+        LogDebug(StringFormat("%s: No valid Fibonacci data available", symbol));
+        return 0.0;
+    }
+    
+    // Collect all Fibonacci levels
+    double fibLevels[5];
+    fibLevels[0] = fibData.fib236;
+    fibLevels[1] = fibData.fib382;
+    fibLevels[2] = fibData.fib500;
+    fibLevels[3] = fibData.fib618;
+    fibLevels[4] = fibData.fib786;
+    
+    // Find the Fibonacci level closest to key level
+    double nearestFib = 0.0;
+    double minDistance = DBL_MAX;
+    string nearestLevelName = "";
+    string levelNames[] = {"23.6%", "38.2%", "50.0%", "61.8%", "78.6%"};
+    
+    for(int i = 0; i < 5; i++)
+    {
+        if(fibLevels[i] <= 0)
+            continue;
+            
+        double distance = MathAbs(fibLevels[i] - keyLevel);
+        
+        if(distance < minDistance)
+        {
+            minDistance = distance;
+            nearestFib = fibLevels[i];
+            nearestLevelName = levelNames[i];
+        }
+    }
+    
+    if(nearestFib > 0)
+    {
+        LogDebug(StringFormat("%s: Nearest Fib to KeyLevel %.5f is %s at %.5f (distance: %.5f)",
+                             symbol, keyLevel, nearestLevelName, nearestFib, minDistance));
+    }
+    else
+    {
+        LogDebug(StringFormat("%s: No valid Fibonacci level found near KeyLevel", symbol));
+    }
+    
+    return nearestFib;
+}
+
+//+------------------------------------------------------------------+
+//| Calculate Point of Interest - WITH BOUNDS CHECKING              |
+//+------------------------------------------------------------------+
+void CalculatePointOfInterest(int index)
+{
+    // CRITICAL: Validate index
+    if(index < 0 || index >= g_symbolCount || index >= ArraySize(g_symbols))
+    {
+        PrintFormat("ERROR: Invalid index %d in CalculatePointOfInterest", index);
+        return;
+    }
+    
+    string symbol = g_symbols[index].symbol;
+    double keyLevel = g_symbols[index].keyLevel;
+    
+    if(keyLevel <= 0)
+    {
+        g_symbols[index].pointOfInterest = 0.0;
+        return;
+    }
+    
+    // Find nearest Fibonacci level to key level
+    double nearestFib = FindNearestFibToKeyLevel(index);
+    
+    if(nearestFib <= 0)
+    {
+        // If no valid Fib found, use key level as point of interest
+        g_symbols[index].pointOfInterest = keyLevel;
+        LogDebug(StringFormat("%s: No Fibonacci match - using KeyLevel %.5f as Point of Interest",
+                             symbol, keyLevel));
+        return;
+    }
+    
+    // Calculate Point of Interest as average of KeyLevel and nearest Fib
+    g_symbols[index].pointOfInterest = (keyLevel + nearestFib) / 2.0;
+    
+    PrintFormat("🎯 %s: Point of Interest = %.5f (KeyLevel: %.5f + NearestFib: %.5f)",
+               symbol, g_symbols[index].pointOfInterest, keyLevel, nearestFib);
+    
+    // Draw Point of Interest on chart (only for current symbol)
+    if(symbol == _Symbol)
+    {
+        string lineName = "PointOfInterest_" + symbol;
+        ObjectDelete(0, lineName);
+        
+        if(g_symbols[index].pointOfInterest > 0)
+        {
+            ObjectCreate(0, lineName, OBJ_HLINE, 0, 0, g_symbols[index].pointOfInterest);
+            ObjectSetInteger(0, lineName, OBJPROP_COLOR, clrOrange);
+            ObjectSetInteger(0, lineName, OBJPROP_STYLE, STYLE_SOLID);
+            ObjectSetInteger(0, lineName, OBJPROP_WIDTH, 3);
+            ObjectSetString(0, lineName, OBJPROP_TEXT, "Point of Interest");
+        }
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Validate Signal with Point of Interest - WITH BOUNDS CHECK      |
+//+------------------------------------------------------------------+
+bool ValidateSignalWithKeyLevel(int index, int signal)
+{
+    // CRITICAL: Validate index
+    if(index < 0 || index >= g_symbolCount || index >= ArraySize(g_symbols))
+    {
+        PrintFormat("ERROR: Invalid index %d in ValidateSignalWithKeyLevel", index);
+        return false;
+    }
+    
+    string symbol = g_symbols[index].symbol;
+    double pointOfInterest = g_symbols[index].pointOfInterest;
+    
+    if(pointOfInterest <= 0)
+    {
+        LogDebug(StringFormat("%s: No valid Point of Interest calculated", symbol));
+        return false;
+    }
+    
+    // Check if price is near Point of Interest using library function
+    if(!IsPriceNearLevel(symbol, pointOfInterest, KeyLevelTolerance))
+    {
+        LogDebug(StringFormat("%s: Price not near Point of Interest %.5f", symbol, pointOfInterest));
+        return false;
+    }
+    
+    // If rejection pattern is required, check using library's PricePosition function
+    if(RequireRejectionPattern)
+    {
+        RejectionSignal rejection = PricePosition(symbol, pointOfInterest, PatternTimeframe);
+        
+        if(signal == 1)  // Buy signal
+        {
+            if(!rejection.isBullishRejection)
+            {
+                LogDebug(StringFormat("%s: No bullish rejection pattern at Point of Interest", symbol));
+                return false;
+            }
+            
+            PrintFormat("✅ %s: Bullish rejection confirmed at POI %.5f - %s", 
+                       symbol, pointOfInterest, rejection.rejectionType);
+        }
+        else if(signal == -1)  // Sell signal
+        {
+            if(!rejection.isBearishRejection)
+            {
+                LogDebug(StringFormat("%s: No bearish rejection pattern at Point of Interest", symbol));
+                return false;
+            }
+            
+            PrintFormat("✅ %s: Bearish rejection confirmed at POI %.5f - %s", 
+                       symbol, pointOfInterest, rejection.rejectionType);
+        }
+    }
+    
+    return true;
+}
+
+//+------------------------------------------------------------------+
+//| Check Trade Cooldown Period - WITH BOUNDS CHECKING              |
+//+------------------------------------------------------------------+
+bool CheckTradeCooldown(int index)
+{
+    // CRITICAL: Validate index
+    if(index < 0 || index >= g_symbolCount || index >= ArraySize(g_symbols))
+    {
+        PrintFormat("ERROR: Invalid index %d in CheckTradeCooldown", index);
+        return false;
+    }
+    
+    if(g_symbols[index].lastTradeTime == 0)
+        return true;
+        
+    datetime timeSinceLast = TimeCurrent() - g_symbols[index].lastTradeTime;
+    int cooldownSeconds = MinutesBetweenTrades * 60;
+    
+    if(timeSinceLast < cooldownSeconds)
+    {
+        LogDebug(StringFormat("%s: Cooldown active - %d seconds remaining",
+                             g_symbols[index].symbol,
+                             cooldownSeconds - (int)timeSinceLast));
+        return false;
+    }
+    
+    return true;
+}
+
+//+------------------------------------------------------------------+
+//| Get Deinitialization Reason Text                                 |
+//+------------------------------------------------------------------+
+string GetDeinitReasonText(int reason)
+{
+    switch(reason)
+    {
+        case REASON_REMOVE:      return "EA removed by user";
+        case REASON_RECOMPILE:   return "EA recompiled";
+        case REASON_CHARTCHANGE: return "Chart changed";
+        case REASON_CHARTCLOSE:  return "Chart closed";
+        case REASON_PARAMETERS:  return "Parameters changed";
+        case REASON_ACCOUNT:     return "Account changed";
+        case REASON_TEMPLATE:    return "Template applied";
+        case REASON_INITFAILED:  return "Initialization failed";
+        case REASON_CLOSE:       return "Terminal closed";
+        default:                 return "Unknown reason";
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Trade Event Function                                              |
+//+------------------------------------------------------------------+
+void OnTrade()
+{
+    // Update position counts
+    g_totalPositions = GetActivePositionsCount();
+    
+    // Validate symbol count
+    if(g_symbolCount <= 0 || g_symbolCount > ArraySize(g_symbols))
+        return;
+    
+    // Update each symbol's position status
+    for(int i = 0; i < g_symbolCount; i++)
+    {
+        // Validate index
+        if(i < 0 || i >= ArraySize(g_symbols))
+            break;
+            
+        if(!g_symbols[i].isActive)
+            continue;
+            
+        string symbol = g_symbols[i].symbol;
+        
+        if(symbol == "" || symbol == NULL)
+            continue;
+            
+        int posCount = GetActivePositionsCount(symbol);
+        bool hadPosition = g_symbols[i].hasPosition;
+        g_symbols[i].hasPosition = (posCount > 0);
+        
+        // Log position changes
+        if(posCount == 0 && hadPosition)
+        {
+            LogDebug(StringFormat("%s: Position closed", symbol));
+        }
+    }
+}
+
+//+------------------------------------------------------------------+
