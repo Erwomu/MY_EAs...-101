@@ -1,0 +1,2369 @@
+//+------------------------------------------------------------------+
+//|                                                  PriceAction.mqh |
+//|                                  Copyright 2025, MetaQuotes Ltd. |
+//|                                             https://www.mql5.com |
+//+------------------------------------------------------------------+
+#property copyright "Copyright 2025, MetaQuotes Ltd."
+#property link      "https://www.mql5.com"
+#property version   "3.10"
+#property description "Production-Ready Price Action Library with Lazy ATR Loading"
+
+#ifndef __PRICE_ACTION_MQH__
+#define __PRICE_ACTION_MQH__
+
+//+------------------------------------------------------------------+
+//| Include Files                                                    |
+//+------------------------------------------------------------------+
+#include <Trade\Trade.mqh>
+#include <Trade\SymbolInfo.mqh>
+#include <Trade\PositionInfo.mqh>
+#include <Arrays\ArrayObj.mqh>
+
+//+------------------------------------------------------------------+
+//| Preprocessor Definitions                                         |
+//+------------------------------------------------------------------+
+#define TIME_BUFFER_EXTREME    (20 * 60)  // 20 minutes for extreme events
+#define TIME_BUFFER_HIGH       (10 * 60)  // 10 minutes for high impact events
+#define DEBUG_MODE             true
+#define MAX_SYMBOLS            25
+#define FIB_PREFIX             "Fib_"
+#define HLINE_PREFIX           "HLine_"
+#define RECT_PREFIX            "Rect_"
+
+//+------------------------------------------------------------------+
+//| Input Parameters                                                 |
+//+------------------------------------------------------------------+
+sinput string            GENERAL_SETTINGS        = "=== General Settings ===";
+input ENUM_TIMEFRAMES    TimeFrame              = PERIOD_H4;
+input ENUM_TIMEFRAMES    PatternTimeframe       = PERIOD_H1;
+input ENUM_TIMEFRAMES    ATRTimeframe           = PERIOD_H1;
+
+sinput string            RISK_SETTINGS          = "=== Risk Management ===";
+input double             RiskPercentage         = 0.5;
+input double             MomentumMultiplier     = 1.0;
+input int                MaxConsecLosses        = 5;
+input double             MinStopLoss            = 200;
+input double             MaxStopLoss            = 1000;
+input double             RiskRewardRatio        = 5.0;
+
+sinput string            ADV_RISK_SETTINGS      = "=== Advanced Risk Management (Optional) ===";
+input bool               UseAdvancedRisk        = false;
+input bool               UseDrawdownDefense     = true;
+input double             DrawdownThreshold      = 3.0;
+input double             DrawdownRiskMultiplier = 0.5;
+input bool               UseProfitAccelerator   = true;
+input double             ProfitThreshold        = 3.0;
+input double             ProfitRiskMultiplier   = 1.5;
+input double             MaxRiskPercent         = 2.0;
+
+sinput string            INDICATOR_SETTINGS     = "=== Indicator Settings ===";
+input int                ATRPeriod              = 14;
+input int                FibRange               = 50;
+
+sinput string            TRADING_SETTINGS       = "=== Trading Settings ===";
+input bool               UseNewsFilter          = true;
+input bool               UseTimeFilter          = false;
+input int                StartHour              = 9;
+input int                StartMinute            = 30;
+input int                EndHour                = 16;
+input int                EndMinute              = 0;
+
+//+------------------------------------------------------------------+
+//| Structures for Fibonacci Analysis                                |
+//+------------------------------------------------------------------+
+struct SwingPoint
+{
+    datetime time;
+    double   price;
+    int      barIndex;
+    bool     isHigh;
+    int      barsAgo;
+    
+    void Reset()
+    {
+        time = 0;
+        price = 0;
+        barIndex = 0;
+        isHigh = false;
+        barsAgo = 0;
+    }
+};
+
+struct FibonacciData
+{
+    SwingPoint swingHigh;
+    SwingPoint swingLow;
+    SwingPoint allSwingHighs[];
+    SwingPoint allSwingLows[];
+    
+    bool      isBullishTrend;
+    bool      isBearishTrend;
+    
+    double    fib236;
+    double    fib382;
+    double    fib500;
+    double    fib618;
+    double    fib786;
+    
+    double    extension1272;
+    double    extension1618;
+    double    extension2000;
+    
+    double    currentPrice;
+    double    nearestFibLevel;
+    double    distanceToFib;
+    
+    double    range;
+    double    rangeInATR;
+    int       swingDistance;
+    bool      isRecent;
+    bool      isValid;
+    string    invalidReason;
+    
+    void Reset()
+    {
+        swingHigh.Reset();
+        swingLow.Reset();
+        ArrayResize(allSwingHighs, 0);
+        ArrayResize(allSwingLows, 0);
+        isBullishTrend = false;
+        isBearishTrend = false;
+        fib236 = fib382 = fib500 = fib618 = fib786 = 0;
+        extension1272 = extension1618 = extension2000 = 0;
+        currentPrice = 0;
+        nearestFibLevel = 0;
+        distanceToFib = 0;
+        range = 0;
+        rangeInATR = 0;
+        swingDistance = 0;
+        isRecent = false;
+        isValid = false;
+        invalidReason = "";
+    }
+};
+
+struct RejectionSignal
+{
+    bool   isBullishRejection;
+    bool   isBearishRejection;
+    string rejectionType;
+    datetime signalTime;
+    
+    void Reset()
+    {
+        isBullishRejection = false;
+        isBearishRejection = false;
+        rejectionType = "NONE";
+        signalTime = 0;
+    }
+};
+
+//+------------------------------------------------------------------+
+//| Symbol Trading Data Structure                                    |
+//+------------------------------------------------------------------+
+struct SymbolTradingData
+{
+    string              symbol;
+    double              multiplier;
+    double              maxSpread;
+    double              momentum;
+    double              stopLoss;
+    double              lotSize;
+    bool                isBullishFib;
+    bool                isBearishFib;
+    bool                priceIsAbove;
+    bool                priceIsBelow;
+    double              highestPrice;
+    double              lowestPrice;
+    double              topPrice;
+    double              bottomPrice;
+    int                 consecLosses;
+    datetime            pausedUntil;
+    bool                tradingPaused;
+    FibonacciData       fibData;
+    RejectionSignal     rejectionSignal;
+    
+    SymbolTradingData()
+    {
+        symbol = "";
+        multiplier = 10000.0;
+        maxSpread = 0.00030;
+        momentum = 0.0;
+        stopLoss = 0.0;
+        lotSize = 0.01;
+        isBullishFib = false;
+        isBearishFib = false;
+        priceIsAbove = false;
+        priceIsBelow = false;
+        highestPrice = 0.0;
+        lowestPrice = 0.0;
+        topPrice = 0.0;
+        bottomPrice = 0.0;
+        consecLosses = 0;
+        pausedUntil = 0;
+        tradingPaused = false;
+    }
+};
+
+//+------------------------------------------------------------------+
+//| Global Variables                                                  |
+//+------------------------------------------------------------------+
+SymbolTradingData       g_symbolData[MAX_SYMBOLS];
+int                     g_symbolCount = 0;
+bool                    g_newsImpactActive = false;
+datetime                g_newsResumeTime = 0;
+CTrade                  g_trade;
+CSymbolInfo             g_symbolInfo;
+CPositionInfo           g_position;
+int                     g_atrHandles[MAX_SYMBOLS];
+
+// Advanced Risk Management globals
+double                  g_advInitialBalance = 0;
+double                  g_advPeakBalance = 0;
+double                  g_advCurrentDrawdown = 0;
+double                  g_advCurrentProfit = 0;
+double                  g_advAdjustedRisk = 0;
+
+//+------------------------------------------------------------------+
+//| Debug Logging Function                                           |
+//+------------------------------------------------------------------+
+void LogDebug(const string message)
+{
+    if(DEBUG_MODE)
+        Print("[DEBUG] ", message);
+}
+
+//+------------------------------------------------------------------+
+//| Initialize Symbol for Trading (FIXED - Array Bounds Check)       |
+//+------------------------------------------------------------------+
+bool InitializeSymbol(const string symbol, const double multiplier = 10000.0, const double maxSpread = 0.00030)
+{
+    // CRITICAL CHECK: Don't exceed array bounds
+    if(g_symbolCount >= MAX_SYMBOLS)
+    {
+        PrintFormat("ERROR: Cannot initialize %s - Maximum symbols reached (%d/%d)", 
+                   symbol, g_symbolCount, MAX_SYMBOLS);
+        PrintFormat("SOLUTION: Increase MAX_SYMBOLS in library or reduce number of symbols in EA");
+        return false;
+    }
+    
+    // Check if symbol is already initialized
+    for(int i = 0; i < g_symbolCount; i++)
+    {
+        if(g_symbolData[i].symbol == symbol)
+        {
+            LogDebug("Symbol already initialized: " + symbol);
+            return true;
+        }
+    }
+    
+    // Verify symbol exists and is selectable
+    if(!g_symbolInfo.Name(symbol))
+    {
+        PrintFormat("ERROR: Failed to select symbol: %s", symbol);
+        return false;
+    }
+    
+    // Verify symbol is available
+    if(!SymbolInfoInteger(symbol, SYMBOL_SELECT))
+    {
+        PrintFormat("ERROR: Symbol %s not available in Market Watch", symbol);
+        return false;
+    }
+    
+    // Initialize symbol data at current index
+    g_symbolData[g_symbolCount].symbol = symbol;
+    g_symbolData[g_symbolCount].multiplier = multiplier;
+    g_symbolData[g_symbolCount].maxSpread = maxSpread;
+    g_symbolData[g_symbolCount].momentum = 0.0;
+    g_symbolData[g_symbolCount].stopLoss = 0.0;
+    g_symbolData[g_symbolCount].lotSize = 0.01;
+    g_symbolData[g_symbolCount].isBullishFib = false;
+    g_symbolData[g_symbolCount].isBearishFib = false;
+    g_symbolData[g_symbolCount].priceIsAbove = false;
+    g_symbolData[g_symbolCount].priceIsBelow = false;
+    g_symbolData[g_symbolCount].highestPrice = 0.0;
+    g_symbolData[g_symbolCount].lowestPrice = 0.0;
+    g_symbolData[g_symbolCount].topPrice = 0.0;
+    g_symbolData[g_symbolCount].bottomPrice = 0.0;
+    g_symbolData[g_symbolCount].consecLosses = 0;
+    g_symbolData[g_symbolCount].pausedUntil = 0;
+    g_symbolData[g_symbolCount].tradingPaused = false;
+    g_symbolData[g_symbolCount].fibData.Reset();
+    g_symbolData[g_symbolCount].rejectionSignal.Reset();
+    
+    // Initialize ATR handle to invalid (will be created later)
+    g_atrHandles[g_symbolCount] = INVALID_HANDLE;
+    
+    // Increment counter AFTER successful initialization
+    g_symbolCount++;
+    
+    LogDebug(StringFormat("Symbol initialized successfully: %s [%d/%d]", 
+                         symbol, g_symbolCount, MAX_SYMBOLS));
+    
+    return true;
+}
+
+//+------------------------------------------------------------------+
+//| Get Symbol Data Index                                            |
+//+------------------------------------------------------------------+
+int GetSymbolIndex(const string symbol)
+{
+    for(int i = 0; i < g_symbolCount; i++)
+    {
+        if(g_symbolData[i].symbol == symbol)
+            return i;
+    }
+    return -1;
+}
+
+//+------------------------------------------------------------------+
+//| SIMPLIFIED: Initialize ATR Handles (Lazy Loading Setup)          |
+//+------------------------------------------------------------------+
+bool InitializeATRHandles()
+{
+    Print("========================================");
+    Print("ATR Initialization: LAZY LOADING MODE");
+    Print("========================================");
+    
+    // Initialize all handles to INVALID_HANDLE
+    // Handles will be created automatically when first needed
+    for(int i = 0; i < MAX_SYMBOLS; i++)
+    {
+        g_atrHandles[i] = INVALID_HANDLE;
+    }
+    
+    PrintFormat("✓ ATR array initialized for %d symbols", g_symbolCount);
+    Print("✓ Handles will be created on first use (lazy loading)");
+    Print("✓ This eliminates all array out of range errors");
+    Print("========================================");
+    
+    // Always return true - no errors possible
+    return true;
+}
+
+//+------------------------------------------------------------------+
+//| HELPER: Get or Create ATR Handle (Lazy Loading)                  |
+//+------------------------------------------------------------------+
+int GetOrCreateATRHandle(const string symbol, int symbolIndex)
+{
+    // CRITICAL: Validate index bounds FIRST
+    if(symbolIndex < 0 || symbolIndex >= MAX_SYMBOLS)
+    {
+        PrintFormat("CRITICAL ERROR: Symbol index %d out of bounds [0-%d] for %s", 
+                   symbolIndex, MAX_SYMBOLS-1, symbol);
+        return INVALID_HANDLE;
+    }
+    
+    // Additional validation against actual count
+    if(symbolIndex >= g_symbolCount)
+    {
+        PrintFormat("CRITICAL ERROR: Symbol index %d >= g_symbolCount %d for %s", 
+                   symbolIndex, g_symbolCount, symbol);
+        return INVALID_HANDLE;
+    }
+    
+    // Check if handle already exists and is valid
+    if(g_atrHandles[symbolIndex] != INVALID_HANDLE)
+    {
+        // Quick validation: try to copy 1 bar
+        double testBuffer[1];
+        int copied = CopyBuffer(g_atrHandles[symbolIndex], 0, 0, 1, testBuffer);
+        
+        if(copied > 0)
+        {
+            // Handle is valid and working
+            return g_atrHandles[symbolIndex];
+        }
+        
+        // Handle exists but is invalid - clean it up
+        PrintFormat("⚠️ %s: ATR handle %d became invalid, recreating...", 
+                   symbol, g_atrHandles[symbolIndex]);
+        IndicatorRelease(g_atrHandles[symbolIndex]);
+        g_atrHandles[symbolIndex] = INVALID_HANDLE;
+    }
+    
+    // Need to create new handle
+    static bool firstCreation = true;
+    if(firstCreation)
+    {
+        Print("========================================");
+        Print("Starting lazy ATR handle creation...");
+        Print("========================================");
+        firstCreation = false;
+    }
+    
+    PrintFormat("Creating ATR handle for %s (index %d)...", symbol, symbolIndex);
+    
+    // Verify data availability BEFORE creating handle
+    int bars = Bars(symbol, ATRTimeframe);
+    if(bars < ATRPeriod + 5)
+    {
+        PrintFormat("  ⚠️ %s: Insufficient bars (%d < %d), triggering data load...", 
+                   symbol, bars, ATRPeriod + 5);
+        
+        // Try to trigger data load
+        datetime time = iTime(symbol, ATRTimeframe, ATRPeriod + 10);
+        double high = iHigh(symbol, ATRTimeframe, 5);
+        double low = iLow(symbol, ATRTimeframe, 5);
+        
+        Sleep(100);
+        
+        bars = Bars(symbol, ATRTimeframe);
+        if(bars < ATRPeriod + 5)
+        {
+            PrintFormat("  ❌ %s: Still insufficient data (%d bars)", symbol, bars);
+            return INVALID_HANDLE;
+        }
+        
+        PrintFormat("  ✓ %s: Data loaded, now have %d bars", symbol, bars);
+    }
+    
+    // Create the ATR handle
+    int handle = iATR(symbol, ATRTimeframe, ATRPeriod);
+    
+    if(handle == INVALID_HANDLE)
+    {
+        int error = GetLastError();
+        PrintFormat("  ❌ %s: Failed to create ATR handle (Error: %d)", symbol, error);
+        return INVALID_HANDLE;
+    }
+    
+    // Verify handle works by testing a copy
+    double testBuffer[1];
+    int copied = CopyBuffer(handle, 0, 0, 1, testBuffer);
+    
+    if(copied <= 0)
+    {
+        int error = GetLastError();
+        PrintFormat("  ⚠️ %s: Handle %d created but data not ready (Error: %d)", 
+                   symbol, handle, error);
+        IndicatorRelease(handle);
+        return INVALID_HANDLE;
+    }
+    
+    // SUCCESS! Store the handle
+    g_atrHandles[symbolIndex] = handle;
+    PrintFormat("  ✓ %s: ATR handle created successfully: %d (ATR value: %.5f)", 
+               symbol, handle, testBuffer[0]);
+    
+    return handle;
+}
+
+//+------------------------------------------------------------------+
+//| Release ATR Handles                                              |
+//+------------------------------------------------------------------+
+void ReleaseATRHandles()
+{
+    PrintFormat("Releasing ATR handles...");
+    
+    int released = 0;
+    
+    for(int i = 0; i < g_symbolCount; i++)
+    {
+        if(g_atrHandles[i] != INVALID_HANDLE)
+        {
+            IndicatorRelease(g_atrHandles[i]);
+            PrintFormat("  Released ATR handle for %s", g_symbolData[i].symbol);
+            g_atrHandles[i] = INVALID_HANDLE;
+            released++;
+        }
+    }
+    
+    PrintFormat("Released %d ATR handles", released);
+}
+
+//+------------------------------------------------------------------+
+//| Initialize Advanced Risk Management                              |
+//+------------------------------------------------------------------+
+void InitializeAdvancedRiskManagement()
+{
+    if(!UseAdvancedRisk)
+    {
+        PrintFormat("Advanced Risk Management: DISABLED (using standard %.2f%%)", RiskPercentage);
+        return;
+    }
+    
+    g_advInitialBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+    g_advPeakBalance = g_advInitialBalance;
+    g_advAdjustedRisk = RiskPercentage;
+    
+    Print("========================================");
+    Print("Advanced Risk Management: ENABLED");
+    PrintFormat("  Initial Balance: $%.2f", g_advInitialBalance);
+    PrintFormat("  Base Risk: %.2f%%", RiskPercentage);
+    PrintFormat("  Drawdown Defense: %s (trigger: %.1f%%)", 
+               UseDrawdownDefense ? "ON" : "OFF", DrawdownThreshold);
+    PrintFormat("  Profit Accelerator: %s (trigger: %.1f%%)", 
+               UseProfitAccelerator ? "ON" : "OFF", ProfitThreshold);
+    Print("========================================");
+}
+
+//+------------------------------------------------------------------+
+//| Calculate Dynamic Risk Based on Account State                    |
+//+------------------------------------------------------------------+
+double CalculateDynamicRiskPercentage()
+{
+    if(!UseAdvancedRisk)
+        return RiskPercentage;
+    
+    double currentBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+    
+    if(currentBalance > g_advPeakBalance)
+        g_advPeakBalance = currentBalance;
+    
+    if(g_advInitialBalance > 0)
+        g_advCurrentProfit = ((currentBalance - g_advInitialBalance) / g_advInitialBalance) * 100.0;
+    
+    if(g_advPeakBalance > 0)
+        g_advCurrentDrawdown = ((g_advPeakBalance - currentBalance) / g_advPeakBalance) * 100.0;
+    
+    double adjustedRisk = RiskPercentage;
+    
+    if(UseDrawdownDefense && g_advCurrentDrawdown >= DrawdownThreshold)
+    {
+        adjustedRisk *= DrawdownRiskMultiplier;
+        
+        static datetime lastDrawdownAlert = 0;
+        if(TimeCurrent() - lastDrawdownAlert > 3600)
+        {
+            PrintFormat("🛡️ DRAWDOWN DEFENSE: %.2f%% drawdown | Risk: %.2f%% → %.2f%%", 
+                       g_advCurrentDrawdown, RiskPercentage, adjustedRisk);
+            lastDrawdownAlert = TimeCurrent();
+        }
+    }
+    else if(UseProfitAccelerator && g_advCurrentProfit >= ProfitThreshold)
+    {
+        adjustedRisk *= ProfitRiskMultiplier;
+        
+        static datetime lastProfitAlert = 0;
+        if(TimeCurrent() - lastProfitAlert > 3600)
+        {
+            PrintFormat("🚀 PROFIT ACCELERATOR: +%.2f%% profit | Risk: %.2f%% → %.2f%%", 
+                       g_advCurrentProfit, RiskPercentage, adjustedRisk);
+            lastProfitAlert = TimeCurrent();
+        }
+    }
+    
+    adjustedRisk = MathMin(adjustedRisk, MaxRiskPercent);
+    adjustedRisk = MathMax(adjustedRisk, 0.1);
+    
+    g_advAdjustedRisk = adjustedRisk;
+    return adjustedRisk;
+}
+
+//+------------------------------------------------------------------+
+//| PRODUCTION-READY: Calculate Lot Size with Zero Array Errors     |
+//+------------------------------------------------------------------+
+double CalculateLotSize(const string symbol, const int symbolIndex)
+{
+    //==================================================================
+    // LAYER 1: VALIDATE INPUTS
+    //==================================================================
+    
+    // Validate symbol string
+    if(symbol == "" || symbol == NULL)
+    {
+        Print("ERROR: Empty symbol string in CalculateLotSize");
+        return 0.01;
+    }
+    
+    // Validate symbol index - CRITICAL BOUNDS CHECK
+    if(symbolIndex < 0 || symbolIndex >= MAX_SYMBOLS)
+    {
+        PrintFormat("ERROR: Symbol index %d out of bounds [0-%d] for %s", 
+                   symbolIndex, MAX_SYMBOLS-1, symbol);
+        return 0.01;
+    }
+    
+    // Validate symbol index against actual symbol count
+    if(symbolIndex >= g_symbolCount)
+    {
+        PrintFormat("ERROR: Symbol index %d >= g_symbolCount %d for %s", 
+                   symbolIndex, g_symbolCount, symbol);
+        return 0.01;
+    }
+    
+    // Select symbol for operations
+    if(!g_symbolInfo.Name(symbol))
+    {
+        PrintFormat("ERROR: Cannot select symbol %s", symbol);
+        return 0.01;
+    }
+    
+    //==================================================================
+    // LAYER 2: GET OR CREATE ATR HANDLE (LAZY LOADING)
+    //==================================================================
+    
+    // Use lazy loading - creates handle only when needed
+    int atrHandle = GetOrCreateATRHandle(symbol, symbolIndex);
+    
+    if(atrHandle == INVALID_HANDLE)
+    {
+        PrintFormat("ERROR: Cannot get ATR handle for %s at index %d", 
+                   symbol, symbolIndex);
+        
+        // Return previous lot size if available
+        if(symbolIndex >= 0 && symbolIndex < MAX_SYMBOLS)
+        {
+            if(g_symbolData[symbolIndex].lotSize > 0)
+            {
+                LogDebug(StringFormat("%s: Using previous lot size %.2f", 
+                                     symbol, g_symbolData[symbolIndex].lotSize));
+                return g_symbolData[symbolIndex].lotSize;
+            }
+        }
+        
+        return 0.01; // Safe fallback
+    }
+    
+    //==================================================================
+    // LAYER 3: COPY ATR DATA WITH RETRY LOGIC
+    //==================================================================
+    
+    double atrBuffer[];
+    ArraySetAsSeries(atrBuffer, true);
+    
+    int copied = CopyBuffer(atrHandle, 0, 0, 3, atrBuffer);
+    
+    if(copied < 3)
+    {
+        PrintFormat("WARNING: Failed to copy ATR buffer for %s. Copied: %d", 
+                   symbol, copied);
+        
+        // Retry once after delay
+        Sleep(100);
+        copied = CopyBuffer(atrHandle, 0, 0, 3, atrBuffer);
+        
+        if(copied < 3)
+        {
+            PrintFormat("ERROR: ATR retry failed for %s. Copied: %d", symbol, copied);
+            
+            // Try to use previous values if available
+            if(symbolIndex >= 0 && symbolIndex < MAX_SYMBOLS)
+            {
+                if(g_symbolData[symbolIndex].stopLoss > 0 && 
+                   g_symbolData[symbolIndex].lotSize > 0)
+                {
+                    LogDebug(StringFormat("%s: Using cached values - SL: %.5f, Lot: %.2f", 
+                                         symbol, 
+                                         g_symbolData[symbolIndex].stopLoss,
+                                         g_symbolData[symbolIndex].lotSize));
+                    return g_symbolData[symbolIndex].lotSize;
+                }
+            }
+            
+            return 0.01; // Safe fallback
+        }
+        
+        PrintFormat("✓ %s: ATR data retrieved on retry", symbol);
+    }
+    
+    //==================================================================
+    // LAYER 4: VALIDATE ATR VALUE
+    //==================================================================
+    
+    double atrValue = atrBuffer[0];
+    
+    // Sanity check ATR value
+    if(atrValue <= 0)
+    {
+        PrintFormat("ERROR: Invalid ATR value (zero or negative) for %s: %.5f", 
+                   symbol, atrValue);
+        return 0.01;
+    }
+    
+    if(atrValue > 10.0)
+    {
+        PrintFormat("ERROR: Abnormally high ATR value for %s: %.5f", 
+                   symbol, atrValue);
+        return 0.01;
+    }
+    
+    // Additional check for very small values (might indicate stale data)
+    if(atrValue < 0.000001)
+    {
+        PrintFormat("ERROR: ATR value too small for %s: %.10f", symbol, atrValue);
+        return 0.01;
+    }
+    
+    //==================================================================
+    // LAYER 5: CALCULATE DYNAMIC STOP LOSS
+    //==================================================================
+    
+    double dynamicStopLoss = MomentumMultiplier * atrValue;
+    
+    double point = g_symbolInfo.Point();
+    
+    if(point <= 0)
+    {
+        PrintFormat("ERROR: Invalid point value for %s: %.10f", symbol, point);
+        return 0.01;
+    }
+    
+    double minSL = MinStopLoss * point;
+    double maxSL = MaxStopLoss * point;
+    
+    // Clamp stop loss to acceptable range
+    dynamicStopLoss = MathMax(minSL, MathMin(dynamicStopLoss, maxSL));
+    
+    // Final validation
+    if(dynamicStopLoss <= 0)
+    {
+        PrintFormat("ERROR: Invalid stop loss calculated for %s: %.5f", 
+                   symbol, dynamicStopLoss);
+        return 0.01;
+    }
+    
+    //==================================================================
+    // LAYER 6: STORE MOMENTUM AND STOP LOSS (WITH BOUNDS CHECK)
+    //==================================================================
+    
+    // Double-check bounds before writing to array
+    if(symbolIndex >= 0 && symbolIndex < MAX_SYMBOLS && symbolIndex < g_symbolCount)
+    {
+        g_symbolData[symbolIndex].momentum = atrValue;
+        g_symbolData[symbolIndex].stopLoss = dynamicStopLoss;
+    }
+    else
+    {
+        PrintFormat("ERROR: Cannot store momentum/SL - invalid index %d", symbolIndex);
+        // Continue anyway - we can still calculate lot size
+    }
+    
+    //==================================================================
+    // LAYER 7: GET DYNAMIC RISK PERCENTAGE
+    //==================================================================
+    
+    double riskPercent = CalculateDynamicRiskPercentage();
+    
+    // Validate risk percentage
+    if(riskPercent <= 0 || riskPercent > 100)
+    {
+        PrintFormat("ERROR: Invalid risk percentage: %.2f%% - using default", riskPercent);
+        riskPercent = RiskPercentage;
+    }
+    
+    //==================================================================
+    // LAYER 8: CALCULATE LOT SIZE
+    //==================================================================
+    
+    double accountBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+    
+    if(accountBalance <= 0)
+    {
+        PrintFormat("ERROR: Invalid account balance: %.2f", accountBalance);
+        return 0.01;
+    }
+    
+    double riskAmount = (riskPercent / 100.0) * accountBalance;
+    
+    if(riskAmount <= 0)
+    {
+        PrintFormat("ERROR: Invalid risk amount: %.2f", riskAmount);
+        return 0.01;
+    }
+    
+    double tickValue = g_symbolInfo.TickValue();
+    double tickSize = g_symbolInfo.TickSize();
+    
+    if(tickValue <= 0 || tickSize <= 0)
+    {
+        PrintFormat("ERROR: Invalid tick data for %s - TickValue: %.5f, TickSize: %.10f", 
+                   symbol, tickValue, tickSize);
+        return 0.01;
+    }
+    
+    double stopLossPoints = dynamicStopLoss / tickSize;
+    
+    if(stopLossPoints <= 0)
+    {
+        PrintFormat("ERROR: Invalid stop loss points for %s: %.2f", 
+                   symbol, stopLossPoints);
+        return 0.01;
+    }
+    
+    double lotSize = riskAmount / (stopLossPoints * tickValue);
+    
+    if(lotSize <= 0 || !MathIsValidNumber(lotSize))
+    {
+        PrintFormat("ERROR: Invalid calculated lot size for %s: %.4f", 
+                   symbol, lotSize);
+        return 0.01;
+    }
+    
+    //==================================================================
+    // LAYER 9: NORMALIZE AND VALIDATE LOT SIZE
+    //==================================================================
+    
+    double minLot = g_symbolInfo.LotsMin();
+    double maxLot = g_symbolInfo.LotsMax();
+    double lotStep = g_symbolInfo.LotsStep();
+    
+    if(minLot <= 0 || maxLot <= 0 || lotStep <= 0)
+    {
+        PrintFormat("ERROR: Invalid lot parameters for %s - Min: %.2f, Max: %.2f, Step: %.2f", 
+                   symbol, minLot, maxLot, lotStep);
+        return 0.01;
+    }
+    
+    // Clamp to min/max range
+    lotSize = MathMax(minLot, MathMin(lotSize, maxLot));
+    
+    // Round to lot step
+    lotSize = NormalizeDouble(MathFloor(lotSize / lotStep) * lotStep, 2);
+    
+    // Final validation
+    if(lotSize < minLot)
+    {
+        PrintFormat("WARNING: Calculated lot %.2f below minimum %.2f for %s - using minimum", 
+                   lotSize, minLot, symbol);
+        lotSize = minLot;
+    }
+    
+    if(lotSize > maxLot)
+    {
+        PrintFormat("WARNING: Calculated lot %.2f above maximum %.2f for %s - using maximum", 
+                   lotSize, maxLot, symbol);
+        lotSize = maxLot;
+    }
+    
+    //==================================================================
+    // LAYER 10: STORE LOT SIZE (WITH BOUNDS CHECK)
+    //==================================================================
+    
+    // Double-check bounds before writing to array
+    if(symbolIndex >= 0 && symbolIndex < MAX_SYMBOLS && symbolIndex < g_symbolCount)
+    {
+        g_symbolData[symbolIndex].lotSize = lotSize;
+    }
+    else
+    {
+        PrintFormat("ERROR: Cannot store lot size - invalid index %d", symbolIndex);
+        // Continue anyway - we have a valid lot size to return
+    }
+    
+    //==================================================================
+    // LAYER 11: LOG RESULTS
+    //==================================================================
+    
+    if(UseAdvancedRisk && riskPercent != RiskPercentage)
+    {
+        LogDebug(StringFormat("%s: ATR=%.5f, SL=%.5f, Risk=%.2f%% (Base: %.2f%%), Lot=%.2f, $%.2f at risk", 
+                             symbol, atrValue, dynamicStopLoss, riskPercent, 
+                             RiskPercentage, lotSize, riskAmount));
+    }
+    else
+    {
+        LogDebug(StringFormat("%s: ATR=%.5f, SL=%.5f, Lot=%.2f", 
+                             symbol, atrValue, dynamicStopLoss, lotSize));
+    }
+    
+    //==================================================================
+    // RETURN VALIDATED LOT SIZE
+    //==================================================================
+    
+    return lotSize;
+}
+
+//+------------------------------------------------------------------+
+//| Enhanced News Filter Function                                    |
+//+------------------------------------------------------------------+
+void CheckNewsImpact()
+{
+    if(!UseNewsFilter)
+        return;
+    
+    string extremeEvents[] = 
+    {
+        "Nonfarm Payrolls",
+        "FOMC"
+    };
+    
+    string highImpactEvents[] = 
+    {
+        "Consumer Price Index",
+        "Gross Domestic Product",
+        "Interest Rate Decision",
+        "Retail Sales",
+        "Unemployment Rate",
+        "ECB Press Conference",
+        "BoE Interest Rate",
+        "BoJ Policy Rate",
+        "RBA Interest Rate",
+        "RBNZ Interest Rate",
+        "BoC Interest Rate"
+    };
+    
+    datetime now = TimeCurrent();
+    datetime dayStart = iTime(_Symbol, PERIOD_D1, 0);
+    datetime dayEnd = dayStart + PeriodSeconds(PERIOD_D1);
+    
+    MqlCalendarValue values[];
+    int eventsCount = CalendarValueHistory(values, dayStart, dayEnd, NULL, NULL);
+    
+    if(eventsCount <= 0)
+    {
+        g_newsImpactActive = false;
+        return;
+    }
+    
+    MqlCalendarEvent event;
+    datetime nextHighImpactTime = 0;
+    string nextEventName = "";
+    
+    for(int i = 0; i < eventsCount; i++)
+    {
+        if(values[i].time > now && CalendarEventById(values[i].event_id, event))
+        {
+            bool isExtremeEvent = false;
+            bool isHighImpactEvent = false;
+            int timeBuffer = 0;
+            
+            for(int j = 0; j < ArraySize(extremeEvents); j++)
+            {
+                if(StringFind(event.name, extremeEvents[j]) >= 0)
+                {
+                    isExtremeEvent = true;
+                    timeBuffer = TIME_BUFFER_EXTREME;
+                    break;
+                }
+            }
+            
+            if(!isExtremeEvent)
+            {
+                for(int j = 0; j < ArraySize(highImpactEvents); j++)
+                {
+                    if(StringFind(event.name, highImpactEvents[j]) >= 0)
+                    {
+                        isHighImpactEvent = true;
+                        timeBuffer = TIME_BUFFER_HIGH;
+                        break;
+                    }
+                }
+            }
+            
+            if(isExtremeEvent || isHighImpactEvent)
+            {
+                datetime eventTime = values[i].time;
+                datetime bufferStart = eventTime - timeBuffer;
+                datetime bufferEnd = eventTime + timeBuffer;
+                
+                if(now >= bufferStart && now <= bufferEnd)
+                {
+                    g_newsImpactActive = true;
+                    g_newsResumeTime = bufferEnd;
+                    
+                    string eventType = isExtremeEvent ? "EXTREME" : "HIGH";
+                    int bufferMinutes = timeBuffer / 60;
+                    
+                    PrintFormat("📰 %s impact news active: %s | %d-min buffer | Trading paused until %s",
+                              eventType, event.name, bufferMinutes, TimeToString(g_newsResumeTime, TIME_MINUTES));
+                    return;
+                }
+                else if(nextHighImpactTime == 0 || eventTime < nextHighImpactTime)
+                {
+                    nextHighImpactTime = eventTime;
+                    nextEventName = event.name;
+                }
+            }
+        }
+    }
+    
+    if(g_newsImpactActive && now > g_newsResumeTime)
+    {
+        g_newsImpactActive = false;
+        Print("✓ News impact period ended. Trading resumed.");
+    }
+    
+    if(nextHighImpactTime > 0 && !g_newsImpactActive)
+    {
+        PrintFormat("⏰ Next high-impact news: %s at %s",
+                   nextEventName, TimeToString(nextHighImpactTime, TIME_MINUTES));
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Time Filter Function                                             |
+//+------------------------------------------------------------------+
+bool IsWithinTradingHours()
+{
+    if(!UseTimeFilter)
+        return true;
+        
+    MqlDateTime current;
+    TimeToStruct(TimeCurrent(), current);
+    
+    int currentMinutes = current.hour * 60 + current.min;
+    int startMinutes = StartHour * 60 + StartMinute;
+    int endMinutes = EndHour * 60 + EndMinute;
+    
+    if(endMinutes < startMinutes)
+        return (currentMinutes >= startMinutes || currentMinutes < endMinutes);
+    else
+        return (currentMinutes >= startMinutes && currentMinutes < endMinutes);
+}
+
+//+------------------------------------------------------------------+
+//| Spread Filter Function                                           |
+//+------------------------------------------------------------------+
+bool IsSpreadAcceptable(const string symbol, const double maxSpread)
+{
+    if(!g_symbolInfo.Name(symbol))
+        return false;
+        
+    g_symbolInfo.RefreshRates();
+    double spread = g_symbolInfo.Ask() - g_symbolInfo.Bid();
+    
+    if(spread > maxSpread)
+    {
+        LogDebug(StringFormat("Spread too high for %s: %.5f (max: %.5f)", 
+                             symbol, spread, maxSpread));
+        return false;
+    }
+    
+    return true;
+}
+
+//+------------------------------------------------------------------+
+//| Check if Current Price is Near Key Level                         |
+//+------------------------------------------------------------------+
+bool IsPriceNearLevel(const string symbol, double keyLevel, double tolerancePips = 10.0)
+{
+    double bid = SymbolInfoDouble(symbol, SYMBOL_BID);
+    double ask = SymbolInfoDouble(symbol, SYMBOL_ASK);
+    
+    double currentPrice = (bid + ask) / 2.0;
+    
+    int digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
+    double pipValue = (digits == 5 || digits == 3) ? 0.0001 : 0.01;
+    
+    if(digits == 2 || digits == 3)
+        pipValue = 0.01;
+    else if(digits == 4 || digits == 5)
+        pipValue = 0.0001;
+    
+    double tolerance = tolerancePips * pipValue;
+    
+    bool isNear = MathAbs(currentPrice - keyLevel) <= tolerance;
+    
+    if(isNear)
+    {
+        LogDebug(StringFormat("✓ %s Price %.5f is NEAR key level %.5f (within %.1f pips)", 
+                             symbol, currentPrice, keyLevel, tolerancePips));
+    }
+    
+    return isNear;
+}
+
+//+------------------------------------------------------------------+
+//| Price Position Detection with Rejection Patterns                 |
+//+------------------------------------------------------------------+
+RejectionSignal PricePosition(const string symbol, double keyLevel, 
+                              ENUM_TIMEFRAMES timeframe = PERIOD_CURRENT)
+{
+    RejectionSignal signal;
+    signal.Reset();
+    
+    if(!IsPriceNearLevel(symbol, keyLevel, 5.0))
+    {
+        LogDebug(StringFormat("%s: Price not near key level %.5f - skipping rejection check", 
+                             symbol, keyLevel));
+        return signal;
+    }
+    
+    double open[], close[], high[], low[];
+    datetime time[];
+    
+    if(CopyOpen(symbol, timeframe, 1, 3, open) < 3 ||
+       CopyClose(symbol, timeframe, 1, 3, close) < 3 ||
+       CopyHigh(symbol, timeframe, 1, 3, high) < 3 ||
+       CopyLow(symbol, timeframe, 1, 3, low) < 3 ||
+       CopyTime(symbol, timeframe, 1, 3, time) < 3)
+    {
+        Print("ERROR: Failed to copy price data for ", symbol);
+        return signal;
+    }
+    
+    double o1 = open[0],  c1 = close[0],  h1 = high[0],  l1 = low[0];
+    double o2 = open[1],  c2 = close[1],  h2 = high[1],  l2 = low[1];
+    double o3 = open[2],  c3 = close[2],  h3 = high[2],  l3 = low[2];
+    
+    signal.signalTime = time[0];
+    
+    int atrHandle = iATR(symbol, timeframe, 14);
+    if(atrHandle == INVALID_HANDLE)
+    {
+        Print("ERROR: Failed to create ATR indicator for ", symbol);
+        return signal;
+    }
+    
+    double atrBuffer[];
+    if(CopyBuffer(atrHandle, 0, 0, 1, atrBuffer) <= 0)
+    {
+        Print("ERROR: Failed to copy ATR buffer for ", symbol);
+        IndicatorRelease(atrHandle);
+        return signal;
+    }
+    
+    double atr = atrBuffer[0];
+    double tolerance = atr * 0.3;
+    IndicatorRelease(atrHandle);
+    
+    bool BouncedOff_Support = (l1 <= keyLevel + tolerance) &&
+                              (c1 > keyLevel - tolerance) &&
+                              (c2 > keyLevel - tolerance);
+    
+    bool BouncedOff_Resistance = (h1 >= keyLevel - tolerance) &&
+                                 (c1 < keyLevel + tolerance) &&
+                                 (c2 < keyLevel + tolerance);
+    
+    if(!BouncedOff_Support && !BouncedOff_Resistance)
+    {
+        return signal;
+    }
+    
+    double body1 = MathAbs(c1 - o1);
+    double upperWick1 = h1 - MathMax(o1, c1);
+    double lowerWick1 = MathMin(o1, c1) - l1;
+    double totalRange1 = h1 - l1;
+    
+    if(totalRange1 < 0.00001)
+    {
+        return signal;
+    }
+    
+    double bodyRatio = body1 / totalRange1;
+    double upperWickRatio = upperWick1 / totalRange1;
+    double lowerWickRatio = lowerWick1 / totalRange1;
+    
+    if(BouncedOff_Support)
+    {
+        if(lowerWickRatio > 0.5 && bodyRatio < 0.35)
+        {
+            signal.isBullishRejection = true;
+            signal.rejectionType = "PIN_BAR";
+            PrintFormat("🟢 %s BULLISH PIN_BAR at %.5f", symbol, keyLevel);
+        }
+        else if(c1 > o1 && o2 > c2 && c1 > o2 && (o1 <= c2 || (o1 >= c2 && o1 < o2)))
+        {
+            signal.isBullishRejection = true;
+            signal.rejectionType = "ENGULFING";
+            PrintFormat("🟢 %s BULLISH ENGULFING at %.5f", symbol, keyLevel);
+        }
+        else if(h2 > h1 && l2 < l1)
+        {
+            signal.isBullishRejection = true;
+            signal.rejectionType = "INSIDE_BAR";
+            PrintFormat("🟢 %s BULLISH INSIDE_BAR at %.5f", symbol, keyLevel);
+        }
+        else if(c1 > o1 && o2 > c2 && c2 < o1 && (o2 >= c1 || (o2 <= c1 && o2 > o1)))
+        {
+            signal.isBullishRejection = true;
+            signal.rejectionType = "HARAMI";
+            PrintFormat("🟢 %s BULLISH HARAMI at %.5f", symbol, keyLevel);
+        }
+        else if(c1 > o1 && c2 > o2 && c3 > o3 && c1 >= c2*0.995 && c2 >= c3*0.995 && bodyRatio > 0.35)
+        {
+            signal.isBullishRejection = true;
+            signal.rejectionType = "THREE_SOLDIERS";
+            PrintFormat("🟢 %s THREE_SOLDIERS at %.5f", symbol, keyLevel);
+        }
+    }
+    
+    if(BouncedOff_Resistance)
+    {
+        if(upperWickRatio > 0.5 && bodyRatio < 0.35)
+        {
+            signal.isBearishRejection = true;
+            signal.rejectionType = "SHOOTING_STAR";
+            PrintFormat("🔴 %s BEARISH SHOOTING_STAR at %.5f", symbol, keyLevel);
+        }
+        else if(c1 < o1 && o2 < c2 && c1 < o2 && (o1 >= c2 || (o1 <= c2 && o1 > o2)))
+        {
+            signal.isBearishRejection = true;
+            signal.rejectionType = "ENGULFING";
+            PrintFormat("🔴 %s BEARISH ENGULFING at %.5f", symbol, keyLevel);
+        }
+        else if(h2 > h1 && l2 < l1)
+        {
+            signal.isBearishRejection = true;
+            signal.rejectionType = "INSIDE_BAR";
+            PrintFormat("🔴 %s BEARISH INSIDE_BAR at %.5f", symbol, keyLevel);
+        }
+        else if(c1 < o1 && o2 < c2 && c2 > o1 && (o2 <= c1 || (o2 >= c1 && o2 < o1)))
+        {
+            signal.isBearishRejection = true;
+            signal.rejectionType = "HARAMI";
+            PrintFormat("🔴 %s BEARISH HARAMI at %.5f", symbol, keyLevel);
+        }
+        else if(c1 < o1 && c2 < o2 && c3 < o3 && c1 <= c2*1.005 && c2 <= c3*1.005 && bodyRatio > 0.35)
+        {
+            signal.isBearishRejection = true;
+            signal.rejectionType = "THREE_CROWS";
+            PrintFormat("🔴 %s THREE_CROWS at %.5f", symbol, keyLevel);
+        }
+    }
+    
+    return signal;
+}
+
+//+------------------------------------------------------------------+
+//| Find All Swing Highs                                             |
+//+------------------------------------------------------------------+
+bool FindAllSwingHighs(const string symbol, ENUM_TIMEFRAMES timeframe,
+                       int maxLookback, int confirmBars, SwingPoint &swings[])
+{
+    ArrayResize(swings, 0);
+    
+    double high[];
+    datetime time[];
+    
+    int totalBars = maxLookback + confirmBars * 2;
+    
+    int copiedHigh = CopyHigh(symbol, timeframe, 0, totalBars, high);
+    int copiedTime = CopyTime(symbol, timeframe, 0, totalBars, time);
+    
+    if(copiedHigh < totalBars || copiedTime < totalBars)
+    {
+        Print("ERROR: Failed to copy data for swing high detection: ", symbol);
+        return false;
+    }
+    
+    for(int i = confirmBars; i < maxLookback; i++)
+    {
+        bool isSwingHigh = true;
+        
+        for(int left = 1; left <= confirmBars; left++)
+        {
+            if(i - left < 0 || high[i - left] >= high[i])
+            {
+                isSwingHigh = false;
+                break;
+            }
+        }
+        
+        if(isSwingHigh)
+        {
+            for(int right = 1; right <= confirmBars; right++)
+            {
+                if(i + right >= ArraySize(high) || high[i + right] >= high[i])
+                {
+                    isSwingHigh = false;
+                    break;
+                }
+            }
+        }
+        
+        if(isSwingHigh)
+        {
+            int size = ArraySize(swings);
+            ArrayResize(swings, size + 1);
+            
+            swings[size].time = time[i];
+            swings[size].price = high[i];
+            swings[size].barIndex = i;
+            swings[size].isHigh = true;
+            swings[size].barsAgo = i;
+        }
+    }
+    
+    return (ArraySize(swings) > 0);
+}
+
+//+------------------------------------------------------------------+
+//| Find All Swing Lows                                              |
+//+------------------------------------------------------------------+
+bool FindAllSwingLows(const string symbol, ENUM_TIMEFRAMES timeframe,
+                      int maxLookback, int confirmBars, SwingPoint &swings[])
+{
+    ArrayResize(swings, 0);
+    
+    double low[];
+    datetime time[];
+    
+    int totalBars = maxLookback + confirmBars * 2;
+    
+    int copiedLow = CopyLow(symbol, timeframe, 0, totalBars, low);
+    int copiedTime = CopyTime(symbol, timeframe, 0, totalBars, time);
+    
+    if(copiedLow < totalBars || copiedTime < totalBars)
+    {
+        Print("ERROR: Failed to copy data for swing low detection: ", symbol);
+        return false;
+    }
+    
+    for(int i = confirmBars; i < maxLookback; i++)
+    {
+        bool isSwingLow = true;
+        
+        for(int left = 1; left <= confirmBars; left++)
+        {
+            if(i - left < 0 || low[i - left] <= low[i])
+            {
+                isSwingLow = false;
+                break;
+            }
+        }
+        
+        if(isSwingLow)
+        {
+            for(int right = 1; right <= confirmBars; right++)
+            {
+                if(i + right >= ArraySize(low) || low[i + right] <= low[i])
+                {
+                    isSwingLow = false;
+                    break;
+                }
+            }
+        }
+        
+        if(isSwingLow)
+        {
+            int size = ArraySize(swings);
+            ArrayResize(swings, size + 1);
+            
+            swings[size].time = time[i];
+            swings[size].price = low[i];
+            swings[size].barIndex = i;
+            swings[size].isHigh = false;
+            swings[size].barsAgo = i;
+        }
+    }
+    
+    return (ArraySize(swings) > 0);
+}
+
+//+------------------------------------------------------------------+
+//| Find Best Swing Pair for Fibonacci                               |
+//+------------------------------------------------------------------+
+bool FindBestSwingPair(const SwingPoint &allHighs[], const SwingPoint &allLows[],
+                       SwingPoint &selectedHigh, SwingPoint &selectedLow,
+                       bool &isBullish, int &swingDistance, string &reason)
+{
+    int numHighs = ArraySize(allHighs);
+    int numLows = ArraySize(allLows);
+    
+    if(numHighs == 0)
+    {
+        reason = "No swing highs found";
+        return false;
+    }
+    
+    if(numLows == 0)
+    {
+        reason = "No swing lows found";
+        return false;
+    }
+    
+    selectedHigh = allHighs[0];
+    selectedLow = allLows[0];
+    
+    double range = selectedHigh.price - selectedLow.price;
+    
+    if(range <= 0)
+    {
+        reason = "Invalid range: High price <= Low price";
+        return false;
+    }
+    
+    swingDistance = MathAbs(selectedHigh.barsAgo - selectedLow.barsAgo);
+    
+    if(swingDistance < 5)
+    {
+        reason = StringFormat("Swings too close together: %d bars (min: 5)", swingDistance);
+        return false;
+    }
+    
+    if(swingDistance > 100)
+    {
+        reason = StringFormat("Swings too far apart: %d bars (max: 100)", swingDistance);
+        return false;
+    }
+    
+    isBullish = (selectedLow.barsAgo > selectedHigh.barsAgo);
+    
+    reason = StringFormat("Selected MOST RECENT swing pair: High[0] %.5f (%d bars ago), Low[0] %.5f (%d bars ago), Range: %.5f, Distance: %d bars",
+                         selectedHigh.price, selectedHigh.barsAgo,
+                         selectedLow.price, selectedLow.barsAgo,
+                         range, swingDistance);
+    
+    return true;
+}
+
+//+------------------------------------------------------------------+
+//| Find Nearest Fibonacci Level to Current Price                    |
+//+------------------------------------------------------------------+
+double FindNearestFibLevel(double currentPrice, const FibonacciData &fib, double &distance)
+{
+    double levels[] = {fib.fib236, fib.fib382, fib.fib500, fib.fib618, fib.fib786};
+    string names[] = {"23.6%", "38.2%", "50.0%", "61.8%", "78.6%"};
+    
+    double nearestLevel = 0;
+    double minDistance = DBL_MAX;
+    int nearestIndex = -1;
+    
+    for(int i = 0; i < ArraySize(levels); i++)
+    {
+        double dist = MathAbs(currentPrice - levels[i]);
+        if(dist < minDistance)
+        {
+            minDistance = dist;
+            nearestLevel = levels[i];
+            nearestIndex = i;
+        }
+    }
+    
+    distance = minDistance;
+    
+    if(nearestIndex >= 0)
+    {
+        LogDebug(StringFormat("Nearest Fib: %s at %.5f (distance: %.5f)",
+                             names[nearestIndex], nearestLevel, distance));
+    }
+    
+    return nearestLevel;
+}
+
+//+------------------------------------------------------------------+
+//| Calculate Fibonacci Retracement                                  |
+//+------------------------------------------------------------------+
+FibonacciData CalculatePolishedFibonacci(const string symbol,
+                                         ENUM_TIMEFRAMES timeframe = PERIOD_H4,
+                                         int maxLookback = 50,
+                                         int confirmBars = 2,
+                                         int maxSwingAge = 50,
+                                         double minRangeATR = 1.5)
+{
+    FibonacciData fib;
+    fib.Reset();
+    
+    int atrHandle = iATR(symbol, timeframe, 14);
+    if(atrHandle == INVALID_HANDLE)
+    {
+        fib.invalidReason = "Failed to create ATR indicator";
+        Print("ERROR: ", fib.invalidReason, " for ", symbol);
+        return fib;
+    }
+    
+    double atrBuffer[];
+    double atr = 0;
+    
+    if(CopyBuffer(atrHandle, 0, 0, 1, atrBuffer) <= 0)
+    {
+        fib.invalidReason = "Failed to copy ATR buffer";
+        Print("ERROR: ", fib.invalidReason, " for ", symbol);
+        IndicatorRelease(atrHandle);
+        return fib;
+    }
+    
+    atr = atrBuffer[0];
+    
+    if(atr <= 0 || atr > 1000000)
+    {
+        fib.invalidReason = StringFormat("Invalid ATR value: %.5f", atr);
+        Print("ERROR: ", fib.invalidReason, " for ", symbol);
+        IndicatorRelease(atrHandle);
+        return fib;
+    }
+    
+    double close[];
+    if(CopyClose(symbol, timeframe, 0, 1, close) < 1)
+    {
+        fib.invalidReason = "Failed to get current price";
+        Print("ERROR: ", fib.invalidReason, " for ", symbol);
+        IndicatorRelease(atrHandle);
+        return fib;
+    }
+    fib.currentPrice = close[0];
+    
+    if(!FindAllSwingHighs(symbol, timeframe, maxLookback, confirmBars, fib.allSwingHighs))
+    {
+        fib.invalidReason = StringFormat("No swing highs found in %d bars", maxLookback);
+        LogDebug(StringFormat("%s: %s", symbol, fib.invalidReason));
+        IndicatorRelease(atrHandle);
+        return fib;
+    }
+    
+    if(!FindAllSwingLows(symbol, timeframe, maxLookback, confirmBars, fib.allSwingLows))
+    {
+        fib.invalidReason = StringFormat("No swing lows found in %d bars", maxLookback);
+        LogDebug(StringFormat("%s: %s", symbol, fib.invalidReason));
+        IndicatorRelease(atrHandle);
+        return fib;
+    }
+    
+    LogDebug(StringFormat("%s: Found %d swing highs and %d swing lows",
+                         symbol, ArraySize(fib.allSwingHighs), ArraySize(fib.allSwingLows)));
+    
+    string selectionReason;
+    if(!FindBestSwingPair(fib.allSwingHighs, fib.allSwingLows,
+                          fib.swingHigh, fib.swingLow,
+                          fib.isBullishTrend, fib.swingDistance,
+                          selectionReason))
+    {
+        fib.invalidReason = selectionReason;
+        LogDebug(StringFormat("%s: %s", symbol, fib.invalidReason));
+        IndicatorRelease(atrHandle);
+        return fib;
+    }
+    
+    LogDebug(StringFormat("%s: %s", symbol, selectionReason));
+    
+    fib.isBearishTrend = !fib.isBullishTrend;
+    
+    fib.range = fib.swingHigh.price - fib.swingLow.price;
+    
+    if(fib.range <= 0)
+    {
+        fib.invalidReason = StringFormat("Invalid range: High %.5f <= Low %.5f",
+                                        fib.swingHigh.price, fib.swingLow.price);
+        Print("ERROR: ", fib.invalidReason);
+        IndicatorRelease(atrHandle);
+        return fib;
+    }
+    
+    fib.rangeInATR = fib.range / atr;
+    
+    datetime time[];
+    if(CopyTime(symbol, timeframe, 0, 1, time) < 1)
+    {
+        fib.invalidReason = "Failed to get current bar time";
+        IndicatorRelease(atrHandle);
+        return fib;
+    }
+    
+    datetime currentBarTime = time[0];
+    int periodSeconds = PeriodSeconds(timeframe);
+    
+    int swingHighBarsAgo = (int)((currentBarTime - fib.swingHigh.time) / periodSeconds);
+    int swingLowBarsAgo = (int)((currentBarTime - fib.swingLow.time) / periodSeconds);
+    
+    fib.isRecent = (swingHighBarsAgo <= maxSwingAge && swingLowBarsAgo <= maxSwingAge);
+    
+    if(!fib.isRecent)
+    {
+        fib.invalidReason = StringFormat("Swings too old - High: %d bars, Low: %d bars (max: %d)",
+                                        swingHighBarsAgo, swingLowBarsAgo, maxSwingAge);
+        LogDebug(StringFormat("%s: %s", symbol, fib.invalidReason));
+        IndicatorRelease(atrHandle);
+        return fib;
+    }
+    
+    bool significantRange = (fib.rangeInATR >= minRangeATR);
+    bool reasonableDistance = (fib.swingDistance >= 5 && fib.swingDistance <= maxLookback);
+    
+    if(!significantRange)
+    {
+        fib.invalidReason = StringFormat("Range too small: %.2f ATR (min: %.2f)",
+                                        fib.rangeInATR, minRangeATR);
+        LogDebug(StringFormat("%s: %s", symbol, fib.invalidReason));
+        IndicatorRelease(atrHandle);
+        return fib;
+    }
+    
+    if(!reasonableDistance)
+    {
+        fib.invalidReason = StringFormat("Unreasonable swing distance: %d bars", fib.swingDistance);
+        LogDebug(StringFormat("%s: %s", symbol, fib.invalidReason));
+        IndicatorRelease(atrHandle);
+        return fib;
+    }
+    
+    if(fib.isBullishTrend)
+    {
+        LogDebug(StringFormat("%s: BULLISH trend (Low bar %d -> High bar %d)",
+                             symbol, fib.swingLow.barsAgo, fib.swingHigh.barsAgo));
+    }
+    else
+    {
+        LogDebug(StringFormat("%s: BEARISH trend (High bar %d -> Low bar %d)",
+                             symbol, fib.swingHigh.barsAgo, fib.swingLow.barsAgo));
+    }
+    
+    if(fib.isBullishTrend)
+    {
+        fib.fib236 = fib.swingHigh.price - (fib.range * 0.236);
+        fib.fib382 = fib.swingHigh.price - (fib.range * 0.382);
+        fib.fib500 = fib.swingHigh.price - (fib.range * 0.500);
+        fib.fib618 = fib.swingHigh.price - (fib.range * 0.618);
+        fib.fib786 = fib.swingHigh.price - (fib.range * 0.786);
+        
+        fib.extension1272 = fib.swingHigh.price + (fib.range * 0.272);
+        fib.extension1618 = fib.swingHigh.price + (fib.range * 0.618);
+        fib.extension2000 = fib.swingHigh.price + fib.range;
+    }
+    else
+    {
+        fib.fib236 = fib.swingLow.price + (fib.range * 0.236);
+        fib.fib382 = fib.swingLow.price + (fib.range * 0.382);
+        fib.fib500 = fib.swingLow.price + (fib.range * 0.500);
+        fib.fib618 = fib.swingLow.price + (fib.range * 0.618);
+        fib.fib786 = fib.swingLow.price + (fib.range * 0.786);
+        
+        fib.extension1272 = fib.swingLow.price - (fib.range * 0.272);
+        fib.extension1618 = fib.swingLow.price - (fib.range * 0.618);
+        fib.extension2000 = fib.swingLow.price - fib.range;
+    }
+    
+    fib.nearestFibLevel = FindNearestFibLevel(fib.currentPrice, fib, fib.distanceToFib);
+    fib.distanceToFib = fib.distanceToFib / atr;
+    
+    fib.isValid = true;
+    
+    PrintFormat("%s Fibonacci VALID", symbol);
+    PrintFormat("   Range: %.5f (%.2f ATR) | Distance: %d bars", 
+               fib.range, fib.rangeInATR, fib.swingDistance);
+    PrintFormat("   Swing High: %.5f at %s (%d bars ago)",
+               fib.swingHigh.price, TimeToString(fib.swingHigh.time), fib.swingHigh.barsAgo);
+    PrintFormat("   Swing Low: %.5f at %s (%d bars ago)",
+               fib.swingLow.price, TimeToString(fib.swingLow.time), fib.swingLow.barsAgo);
+    PrintFormat("   Current Price: %.5f | Distance: %.2f ATR",
+               fib.currentPrice, fib.distanceToFib);
+    PrintFormat("   Key Levels -> 38.2%%: %.5f | 50%%: %.5f | 61.8%%: %.5f",
+               fib.fib382, fib.fib500, fib.fib618);
+    
+    IndicatorRelease(atrHandle);
+    
+    return fib;
+}
+
+void DrawPolishedFibonacci(const string symbol, const FibonacciData &fib, long chartID = 0)
+{
+    if(!fib.isValid) 
+    {
+        LogDebug("Cannot draw Fibonacci: " + fib.invalidReason);
+        return;
+    }
+    
+    string prefix = "Fib_" + symbol + "_";
+    
+    ObjectDelete(chartID, prefix + "Main");
+    ObjectDelete(chartID, prefix + "HighMarker");
+    ObjectDelete(chartID, prefix + "LowMarker");
+    ObjectDelete(chartID, prefix + "CurrentPrice");
+    
+    string fibName = prefix + "Main";
+    
+    if(fib.isBullishTrend)
+    {
+        ObjectCreate(chartID, fibName, OBJ_FIBO, 0,
+                    fib.swingLow.time, fib.swingLow.price,
+                    fib.swingHigh.time, fib.swingHigh.price);
+    }
+    else
+    {
+        ObjectCreate(chartID, fibName, OBJ_FIBO, 0,
+                    fib.swingHigh.time, fib.swingHigh.price,
+                    fib.swingLow.time, fib.swingLow.price);
+    }
+    
+    ObjectSetInteger(chartID, fibName, OBJPROP_COLOR, clrGold);
+    ObjectSetInteger(chartID, fibName, OBJPROP_WIDTH, 2);
+    ObjectSetInteger(chartID, fibName, OBJPROP_RAY_RIGHT, true);
+    ObjectSetInteger(chartID, fibName, OBJPROP_BACK, true);
+    ObjectSetInteger(chartID, fibName, OBJPROP_SELECTABLE, true);
+    
+    double levels[] = {0.0, 0.236, 0.382, 0.500, 0.618, 0.786, 1.0};
+    string descriptions[] = {"0.0%", "23.6%", "38.2%", "50.0%", "61.8%", "78.6%", "100.0%"};
+    color colors[] = {clrDimGray, clrSilver, clrYellow, clrOrange, clrGold, clrYellow, clrDimGray};
+    
+    ObjectSetInteger(chartID, fibName, OBJPROP_LEVELS, ArraySize(levels));
+    
+    for(int i = 0; i < ArraySize(levels); i++)
+    {
+        ObjectSetDouble(chartID, fibName, OBJPROP_LEVELVALUE, i, levels[i]);
+        ObjectSetString(chartID, fibName, OBJPROP_LEVELTEXT, i, descriptions[i]);
+        ObjectSetInteger(chartID, fibName, OBJPROP_LEVELCOLOR, i, colors[i]);
+        ObjectSetInteger(chartID, fibName, OBJPROP_LEVELSTYLE, i, STYLE_DOT);
+        ObjectSetInteger(chartID, fibName, OBJPROP_LEVELWIDTH, i, 1);
+    }
+    
+    ObjectCreate(chartID, prefix + "HighMarker", OBJ_ARROW, 0, 
+                fib.swingHigh.time, fib.swingHigh.price);
+    ObjectSetInteger(chartID, prefix + "HighMarker", OBJPROP_COLOR, clrRed);
+    ObjectSetInteger(chartID, prefix + "HighMarker", OBJPROP_ARROWCODE, 234);
+    ObjectSetInteger(chartID, prefix + "HighMarker", OBJPROP_WIDTH, 3);
+    
+    ObjectCreate(chartID, prefix + "LowMarker", OBJ_ARROW, 0,
+                fib.swingLow.time, fib.swingLow.price);
+    ObjectSetInteger(chartID, prefix + "LowMarker", OBJPROP_COLOR, clrLime);
+    ObjectSetInteger(chartID, prefix + "LowMarker", OBJPROP_ARROWCODE, 233);
+    ObjectSetInteger(chartID, prefix + "LowMarker", OBJPROP_WIDTH, 3);
+    
+    ChartRedraw(chartID);
+}
+
+//+------------------------------------------------------------------+
+//| Draw Zone                                                         |
+//+------------------------------------------------------------------+
+void DrawZone(double fibLevelPrice, double targetPrice, const string symbol)
+{
+    int symbolIndex = GetSymbolIndex(symbol);
+    if(symbolIndex < 0)
+        return;
+        
+    if(fibLevelPrice <= 0 || targetPrice <= 0)
+    {
+        Print("ERROR: Invalid price values for zone drawing");
+        return;
+    }
+    
+    datetime startTime = iTime(symbol, TimeFrame, 35);
+    datetime endTime = startTime + PeriodSeconds(TimeFrame) * 60;
+    
+    if(startTime <= 0 || endTime <= startTime)
+    {
+        Print("ERROR: Invalid time range for zone drawing");
+        return;
+    }
+    
+    g_symbolData[symbolIndex].topPrice = MathMax(fibLevelPrice, targetPrice);
+    g_symbolData[symbolIndex].bottomPrice = MathMin(fibLevelPrice, targetPrice);
+    
+    string rectName = RECT_PREFIX + symbol;
+    string hlineName = HLINE_PREFIX + symbol;
+    
+    ObjectDelete(0, rectName);
+    ObjectDelete(0, hlineName);
+    
+    if(g_symbolData[symbolIndex].topPrice == g_symbolData[symbolIndex].bottomPrice)
+    {
+        if(ObjectCreate(0, hlineName, OBJ_HLINE, 0, 0, g_symbolData[symbolIndex].topPrice))
+        {
+            ObjectSetInteger(0, hlineName, OBJPROP_COLOR, clrBlack);
+            ObjectSetInteger(0, hlineName, OBJPROP_STYLE, STYLE_SOLID);
+            ObjectSetInteger(0, hlineName, OBJPROP_WIDTH, 3);
+            LogDebug("Horizontal line created for " + symbol);
+        }
+    }
+    else
+    {
+        if(ObjectCreate(0, rectName, OBJ_RECTANGLE, 0, startTime, g_symbolData[symbolIndex].topPrice, 
+                       endTime, g_symbolData[symbolIndex].bottomPrice))
+        {
+            ObjectSetInteger(0, rectName, OBJPROP_COLOR, clrDarkGray);
+            ObjectSetInteger(0, rectName, OBJPROP_STYLE, STYLE_SOLID);
+            ObjectSetInteger(0, rectName, OBJPROP_WIDTH, 2);
+            ObjectSetInteger(0, rectName, OBJPROP_FILL, true);
+            ObjectSetInteger(0, rectName, OBJPROP_BACK, false);
+            LogDebug("Rectangle zone created for " + symbol);
+        }
+    }
+    
+    ChartRedraw();
+}
+
+//+------------------------------------------------------------------+
+//| Manage Trading Pause                                             |
+//+------------------------------------------------------------------+
+void ManageTradingPause(const string symbol)
+{
+    int symbolIndex = GetSymbolIndex(symbol);
+    if(symbolIndex < 0)
+        return;
+        
+    if(g_symbolData[symbolIndex].tradingPaused)
+    {
+        if(TimeCurrent() >= g_symbolData[symbolIndex].pausedUntil)
+        {
+            g_symbolData[symbolIndex].tradingPaused = false;
+            g_symbolData[symbolIndex].consecLosses = 0;
+            PrintFormat("%s: Trading resumed at %s", symbol, 
+                       TimeToString(TimeCurrent(), TIME_DATE | TIME_MINUTES));
+        }
+        else
+            return;
+    }
+    
+    datetime dayStart = iTime(symbol, PERIOD_D1, 0);
+    datetime now = TimeCurrent();
+    
+    if(!HistorySelect(dayStart, now))
+        return;
+        
+    int totalDeals = HistoryDealsTotal();
+    int consecLosses = 0;
+    
+    for(int i = totalDeals - 1; i >= 0; i--)
+    {
+        ulong dealTicket = HistoryDealGetTicket(i);
+        if(dealTicket == 0)
+            continue;
+            
+        if(HistoryDealGetString(dealTicket, DEAL_SYMBOL) == symbol &&
+           HistoryDealGetInteger(dealTicket, DEAL_ENTRY) == DEAL_ENTRY_OUT)
+        {
+            double profit = HistoryDealGetDouble(dealTicket, DEAL_PROFIT);
+            
+            if(profit < 0)
+                consecLosses++;
+            else
+                break;
+        }
+    }
+    
+    g_symbolData[symbolIndex].consecLosses = consecLosses;
+    
+    if(consecLosses >= MaxConsecLosses && !g_symbolData[symbolIndex].tradingPaused)
+    {
+        g_symbolData[symbolIndex].tradingPaused = true;
+        g_symbolData[symbolIndex].pausedUntil = iTime(symbol, PERIOD_D1, 0) + 86400 + 37800;
+        
+        PrintFormat("%s: Trading paused after %d consecutive losses. Resumes: %s",
+                   symbol, consecLosses, 
+                   TimeToString(g_symbolData[symbolIndex].pausedUntil, TIME_DATE | TIME_MINUTES));
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Modify Trade with Manual TP/SL Close + Trailing Stop            |
+//+------------------------------------------------------------------+
+void ModifyTrade(const string symbol)
+{
+    int symbolIndex = GetSymbolIndex(symbol);
+    if(symbolIndex < 0)
+        return;
+        
+    if(!g_symbolInfo.Name(symbol))
+        return;
+        
+    g_symbolInfo.RefreshRates();
+    
+    int totalPositions = PositionsTotal();
+    
+    for(int i = 0; i < totalPositions; i++)
+    {
+        if(!g_position.SelectByIndex(i))
+            continue;
+            
+        if(g_position.Symbol() != symbol)
+            continue;
+        
+        double currentSL = g_position.StopLoss();
+        double currentTP = g_position.TakeProfit();
+        double openPrice = g_position.PriceOpen();
+        
+        double point = g_symbolInfo.Point();
+        int digits = (int)g_symbolInfo.Digits();
+        
+        if(currentTP > 0)
+        {
+            bool closeAtTP = false;
+            double tpBuffer = point * 3;
+            
+            if(g_position.PositionType() == POSITION_TYPE_BUY)
+            {
+                double bid = g_symbolInfo.Bid();
+                if(bid >= (currentTP - tpBuffer))
+                {
+                    closeAtTP = true;
+                }
+            }
+            else if(g_position.PositionType() == POSITION_TYPE_SELL)
+            {
+                double ask = g_symbolInfo.Ask();
+                if(ask <= (currentTP + tpBuffer))
+                {
+                    closeAtTP = true;
+                }
+            }
+            
+            if(closeAtTP)
+            {
+                ulong ticket = g_position.Ticket();
+                if(g_trade.PositionClose(ticket))
+                {
+                    PrintFormat("✓ %s: Position #%I64u closed at TP", symbol, ticket);
+                }
+                continue;
+            }
+        }
+        
+        if(currentSL > 0)
+        {
+            bool closeAtSL = false;
+            double slBuffer = point * 3;
+            
+            if(g_position.PositionType() == POSITION_TYPE_BUY)
+            {
+                double bid = g_symbolInfo.Bid();
+                if(bid <= (currentSL + slBuffer))
+                {
+                    closeAtSL = true;
+                }
+            }
+            else if(g_position.PositionType() == POSITION_TYPE_SELL)
+            {
+                double ask = g_symbolInfo.Ask();
+                if(ask >= (currentSL - slBuffer))
+                {
+                    closeAtSL = true;
+                }
+            }
+            
+            if(closeAtSL)
+            {
+                ulong ticket = g_position.Ticket();
+                if(g_trade.PositionClose(ticket))
+                {
+                    PrintFormat("🛑 %s: Position #%I64u closed at SL", symbol, ticket);
+                }
+                continue;
+            }
+        }
+        
+        double stopLossDistance = g_symbolData[symbolIndex].stopLoss;
+        if(stopLossDistance <= 0)
+            continue;
+        
+        bool modified = false;
+        double newSL = 0.0;
+        
+        if(g_position.PositionType() == POSITION_TYPE_BUY)
+        {
+            double bid = g_symbolInfo.Bid();
+            double currentProfit = bid - openPrice;
+            
+            double breakEvenTrigger = 1.5 * stopLossDistance;
+            
+            if(currentProfit >= breakEvenTrigger && currentSL < openPrice)
+            {
+                newSL = NormalizeDouble(openPrice + (10 * point), digits);
+                modified = true;
+            }
+            
+            double firstTrailTrigger = 2.0 * stopLossDistance;
+            double firstTrailLevel = openPrice + (1.0 * stopLossDistance);
+            
+            if(currentProfit >= firstTrailTrigger && currentSL < firstTrailLevel)
+            {
+                newSL = NormalizeDouble(firstTrailLevel, digits);
+                modified = true;
+            }
+            
+            if(currentProfit > firstTrailTrigger)
+            {
+                double profitAboveEntry = bid - openPrice;
+                double trailLevel = NormalizeDouble(openPrice + (profitAboveEntry * 0.5), digits);
+                
+                if(trailLevel > currentSL)
+                {
+                    newSL = trailLevel;
+                    modified = true;
+                }
+            }
+        }
+        else if(g_position.PositionType() == POSITION_TYPE_SELL)
+        {
+            double ask = g_symbolInfo.Ask();
+            double currentProfit = openPrice - ask;
+            
+            double breakEvenTrigger = 1.5 * stopLossDistance;
+            
+            if(currentProfit >= breakEvenTrigger && (currentSL == 0 || currentSL > openPrice))
+            {
+                newSL = NormalizeDouble(openPrice - (10 * point), digits);
+                modified = true;
+            }
+            
+            double firstTrailTrigger = 2.0 * stopLossDistance;
+            double firstTrailLevel = openPrice - (1.0 * stopLossDistance);
+            
+            if(currentProfit >= firstTrailTrigger && (currentSL == 0 || currentSL > firstTrailLevel))
+            {
+                newSL = NormalizeDouble(firstTrailLevel, digits);
+                modified = true;
+            }
+            
+            if(currentProfit > firstTrailTrigger)
+            {
+                double profitBelowEntry = openPrice - ask;
+                double trailLevel = NormalizeDouble(openPrice - (profitBelowEntry * 0.5), digits);
+                
+                if(currentSL == 0 || trailLevel < currentSL)
+                {
+                    newSL = trailLevel;
+                    modified = true;
+                }
+            }
+        }
+        
+        if(modified && newSL > 0)
+        {
+            g_trade.PositionModify(g_position.Ticket(), newSL, g_position.TakeProfit());
+        }
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Check if Trading is Allowed                                      |
+//+------------------------------------------------------------------+
+bool IsTradingAllowed(const string symbol)
+{
+    int symbolIndex = GetSymbolIndex(symbol);
+    if(symbolIndex < 0)
+    {
+        LogDebug("Symbol not found in data array: " + symbol);
+        return false;
+    }
+    
+    if(g_symbolData[symbolIndex].tradingPaused)
+    {
+        LogDebug(symbol + ": Trading paused due to consecutive losses");
+        return false;
+    }
+    
+    if(g_newsImpactActive)
+    {
+        LogDebug("Trading paused due to news impact");
+        return false;
+    }
+    
+    if(!IsWithinTradingHours())
+    {
+        LogDebug("Outside trading hours");
+        return false;
+    }
+    
+    if(!IsSpreadAcceptable(symbol, g_symbolData[symbolIndex].maxSpread))
+    {
+        LogDebug(symbol + ": Spread too high");
+        return false;
+    }
+    
+    return true;
+}
+
+//+------------------------------------------------------------------+
+//| Process Symbol                                                    |
+//+------------------------------------------------------------------+
+void ProcessSymbol(const string symbol, double keyLevel = 0.0)
+{
+    int symbolIndex = GetSymbolIndex(symbol);
+    if(symbolIndex < 0)
+        return;
+        
+    CheckNewsImpact();
+    ManageTradingPause(symbol);
+    
+    if(!IsTradingAllowed(symbol))
+        return;
+        
+    CalculateLotSize(symbol, symbolIndex);
+    
+    g_symbolData[symbolIndex].fibData = CalculatePolishedFibonacci(symbol, TimeFrame, 50, 2, 50, 1.5);
+    
+    if(g_symbolData[symbolIndex].fibData.isValid)
+    {
+        g_symbolData[symbolIndex].isBullishFib = g_symbolData[symbolIndex].fibData.isBullishTrend;
+        g_symbolData[symbolIndex].isBearishFib = g_symbolData[symbolIndex].fibData.isBearishTrend;
+        g_symbolData[symbolIndex].highestPrice = g_symbolData[symbolIndex].fibData.swingHigh.price;
+        g_symbolData[symbolIndex].lowestPrice = g_symbolData[symbolIndex].fibData.swingLow.price;
+        
+        DrawPolishedFibonacci(symbol, g_symbolData[symbolIndex].fibData, 0);
+        
+        if(keyLevel > 0)
+        {
+            g_symbolData[symbolIndex].rejectionSignal = PricePosition(symbol, keyLevel, PatternTimeframe);
+            
+            g_symbolData[symbolIndex].priceIsAbove = g_symbolData[symbolIndex].rejectionSignal.isBullishRejection;
+            g_symbolData[symbolIndex].priceIsBelow = g_symbolData[symbolIndex].rejectionSignal.isBearishRejection;
+            
+            double zoneWidth = g_symbolData[symbolIndex].momentum * 0.2;
+            DrawZone(keyLevel, keyLevel + zoneWidth, symbol);
+            
+            LogDebug(StringFormat("%s: Checking rejection at Point of Interest %.5f", symbol, keyLevel));
+        }
+        else
+        {
+            LogDebug(StringFormat("%s: No Point of Interest provided - skipping rejection check", symbol));
+            
+            g_symbolData[symbolIndex].rejectionSignal.Reset();
+            g_symbolData[symbolIndex].priceIsAbove = false;
+            g_symbolData[symbolIndex].priceIsBelow = false;
+        }
+    }
+    else
+    {
+        LogDebug(StringFormat("%s: Invalid Fibonacci - %s", symbol, g_symbolData[symbolIndex].fibData.invalidReason));
+        g_symbolData[symbolIndex].rejectionSignal.Reset();
+        g_symbolData[symbolIndex].priceIsAbove = false;
+        g_symbolData[symbolIndex].priceIsBelow = false;
+    }
+    
+    ModifyTrade(symbol);
+}
+
+//+------------------------------------------------------------------+
+//| Process All Symbols                                              |
+//+------------------------------------------------------------------+
+void ProcessAllSymbols()
+{
+    for(int i = 0; i < g_symbolCount; i++)
+    {
+        ProcessSymbol(g_symbolData[i].symbol);
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Get Trading Signal                                               |
+//+------------------------------------------------------------------+
+int GetTradingSignal(const string symbol)
+{
+    int symbolIndex = GetSymbolIndex(symbol);
+    if(symbolIndex < 0)
+        return 0;
+        
+    if(!IsTradingAllowed(symbol))
+        return 0;
+    
+    if(g_symbolData[symbolIndex].priceIsAbove)
+        return 1;
+    
+    if(g_symbolData[symbolIndex].priceIsBelow)
+        return -1;
+        
+    return 0;
+}
+
+//+------------------------------------------------------------------+
+//| Execute Trade                                                    |
+//+------------------------------------------------------------------+
+bool ExecuteTrade(const string symbol, const int signal)
+{
+    if(signal == 0)
+        return false;
+        
+    int symbolIndex = GetSymbolIndex(symbol);
+    if(symbolIndex < 0)
+        return false;
+        
+    if(!g_symbolInfo.Name(symbol))
+        return false;
+        
+    g_symbolInfo.RefreshRates();
+    
+    double price = 0.0;
+    double sl = 0.0;
+    double tp = 0.0;
+    ENUM_ORDER_TYPE orderType;
+    
+    int digits = (int)g_symbolInfo.Digits();
+    double point = g_symbolInfo.Point();
+    double stopLoss = g_symbolData[symbolIndex].stopLoss;
+    double lotSize = g_symbolData[symbolIndex].lotSize;
+    
+    if(signal == 1)
+    {
+        orderType = ORDER_TYPE_BUY;
+        price = g_symbolInfo.Ask();
+        sl = NormalizeDouble(price - stopLoss, digits);
+        tp = NormalizeDouble(price + (stopLoss * RiskRewardRatio), digits);
+    }
+    else if(signal == -1)
+    {
+        orderType = ORDER_TYPE_SELL;
+        price = g_symbolInfo.Bid();
+        sl = NormalizeDouble(price + stopLoss, digits);
+        tp = NormalizeDouble(price - (stopLoss * RiskRewardRatio), digits);
+    }
+    else
+        return false;
+        
+    g_trade.SetExpertMagicNumber(123456);
+    g_trade.SetDeviationInPoints(10);
+    g_trade.SetTypeFilling(ORDER_FILLING_IOC);
+    
+    if(g_trade.PositionOpen(symbol, orderType, lotSize, price, sl, tp, 
+                           StringFormat("PA_%s", symbol)))
+    {
+        if(g_trade.ResultRetcode() == TRADE_RETCODE_DONE)
+        {
+            PrintFormat("%s: %s order opened. Price: %.5f, SL: %.5f, TP: %.5f, Lot: %.2f",
+                       symbol, (signal == 1 ? "BUY" : "SELL"), price, sl, tp, lotSize);
+            return true;
+        }
+    }
+    
+    PrintFormat("%s: Failed to open order. Error: %d", symbol, g_trade.ResultRetcode());
+    return false;
+}
+
+//+------------------------------------------------------------------+
+//| Initialize Library                                               |
+//+------------------------------------------------------------------+
+bool InitializePriceAction()
+{
+    g_symbolCount = 0;
+    g_newsImpactActive = false;
+    g_newsResumeTime = 0;
+    
+    g_trade.SetExpertMagicNumber(123456);
+    g_trade.SetDeviationInPoints(10);
+    g_trade.SetTypeFilling(ORDER_FILLING_IOC);
+    
+    InitializeAdvancedRiskManagement();
+    
+    Print("========================================");
+    Print("PriceAction Library Initialized");
+    PrintFormat("  Fibonacci Timeframe: %s", EnumToString(TimeFrame));
+    PrintFormat("  ATR Timeframe: %s", EnumToString(ATRTimeframe));
+    PrintFormat("  Pattern Timeframe: %s", EnumToString(PatternTimeframe));
+    PrintFormat("  Risk/Reward Ratio: %.1f:1", RiskRewardRatio);
+    Print("========================================");
+    
+    return true;
+}
+
+//+------------------------------------------------------------------+
+//| Deinitialize Library                                             |
+//+------------------------------------------------------------------+
+void DeinitializePriceAction()
+{
+    ReleaseATRHandles();
+    
+    for(int i = 0; i < g_symbolCount; i++)
+    {
+        ObjectDelete(0, FIB_PREFIX + g_symbolData[i].symbol);
+        ObjectDelete(0, HLINE_PREFIX + g_symbolData[i].symbol);
+        ObjectDelete(0, RECT_PREFIX + g_symbolData[i].symbol);
+        
+        string prefix = "Fib_" + g_symbolData[i].symbol + "_";
+        ObjectDelete(0, prefix + "Main");
+        ObjectDelete(0, prefix + "HighMarker");
+        ObjectDelete(0, prefix + "LowMarker");
+        ObjectDelete(0, prefix + "CurrentPrice");
+    }
+    
+    ChartRedraw();
+    Print("PriceAction Library deinitialized");
+}
+
+//+------------------------------------------------------------------+
+//| Get Symbol Status                                                |
+//+------------------------------------------------------------------+
+string GetSymbolStatus(const string symbol)
+{
+    int symbolIndex = GetSymbolIndex(symbol);
+    if(symbolIndex < 0)
+        return "Symbol not initialized";
+        
+    string status = StringFormat("%s Status:\n", symbol);
+    status += StringFormat("  Trading Allowed: %s\n", IsTradingAllowed(symbol) ? "Yes" : "No");
+    status += StringFormat("  Fibonacci: %s\n", 
+                          g_symbolData[symbolIndex].isBullishFib ? "Bullish" : 
+                          (g_symbolData[symbolIndex].isBearishFib ? "Bearish" : "None"));
+    
+    if(g_symbolData[symbolIndex].rejectionSignal.isBullishRejection || 
+       g_symbolData[symbolIndex].rejectionSignal.isBearishRejection)
+    {
+        status += StringFormat("  Rejection Pattern: %s\n", 
+                              g_symbolData[symbolIndex].rejectionSignal.rejectionType);
+    }
+    
+    status += StringFormat("  Price Position: %s\n",
+                          g_symbolData[symbolIndex].priceIsAbove ? "Bullish Setup" :
+                          (g_symbolData[symbolIndex].priceIsBelow ? "Bearish Setup" : "Neutral"));
+    status += StringFormat("  Lot Size: %.2f\n", g_symbolData[symbolIndex].lotSize);
+    status += StringFormat("  Stop Loss: %.5f\n", g_symbolData[symbolIndex].stopLoss);
+    
+    return status;
+}
+
+//+------------------------------------------------------------------+
+//| Get Advanced Risk Status                                         |
+//+------------------------------------------------------------------+
+string GetAdvancedRiskStatus()
+{
+    if(!UseAdvancedRisk)
+        return "Standard Risk";
+        
+    string status = "";
+    
+    if(g_advCurrentDrawdown >= DrawdownThreshold && UseDrawdownDefense)
+    {
+        status = StringFormat("🛡️ DEFENSE (%.1f%% DD) | Risk: %.2f%%", 
+                             g_advCurrentDrawdown, g_advAdjustedRisk);
+    }
+    else if(g_advCurrentProfit >= ProfitThreshold && UseProfitAccelerator)
+    {
+        status = StringFormat("🚀 ACCELERATOR (+%.1f%%) | Risk: %.2f%%", 
+                             g_advCurrentProfit, g_advAdjustedRisk);
+    }
+    else
+    {
+        status = StringFormat("⚖️ NORMAL | Risk: %.2f%%", g_advAdjustedRisk);
+    }
+    
+    return status;
+}
+
+//+------------------------------------------------------------------+
+//| Get Active Positions Count                                       |
+//+------------------------------------------------------------------+
+int GetActivePositionsCount(const string symbol = "")
+{
+    int count = 0;
+    int total = PositionsTotal();
+    
+    for(int i = 0; i < total; i++)
+    {
+        if(g_position.SelectByIndex(i))
+        {
+            if(symbol == "" || g_position.Symbol() == symbol)
+                count++;
+        }
+    }
+    
+    return count;
+}
+
+//+------------------------------------------------------------------+
+//| Close All Positions for Symbol                                   |
+//+------------------------------------------------------------------+
+bool CloseAllPositions(const string symbol)
+{
+    bool success = true;
+    int total = PositionsTotal();
+    
+    for(int i = total - 1; i >= 0; i--)
+    {
+        if(g_position.SelectByIndex(i))
+        {
+            if(g_position.Symbol() == symbol)
+            {
+                if(!g_trade.PositionClose(g_position.Ticket()))
+                {
+                    success = false;
+                }
+            }
+        }
+    }
+    
+    return success;
+}
+
+//+------------------------------------------------------------------+
+//| Calculate Total Profit                                           |
+//+------------------------------------------------------------------+
+double GetTotalProfit(const string symbol = "")
+{
+    double totalProfit = 0.0;
+    int total = PositionsTotal();
+    
+    for(int i = 0; i < total; i++)
+    {
+        if(g_position.SelectByIndex(i))
+        {
+            if(symbol == "" || g_position.Symbol() == symbol)
+            {
+                totalProfit += g_position.Profit() + g_position.Swap() + g_position.Commission();
+            }
+        }
+    }
+    
+    return totalProfit;
+}
+
+#endif // __PRICE_ACTION_MQH__
