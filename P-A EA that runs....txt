@@ -1,0 +1,716 @@
+//+------------------------------------------------------------------+
+//|                                              L'ACTION DE PRIX.mq5 |
+//|                                  Copyright 2025, MetaQuotes Ltd. |
+//|                                             https://www.mql5.com |
+//+------------------------------------------------------------------+
+#property copyright "Copyright 2025, MetaQuotes Ltd."
+#property link      "https://www.mql5.com"
+#property version   "3.03"
+#property description "Multi-Symbol Price Action Trading System - Complete Bounds Fix"
+#property description "Integrated with PriceAction.mqh Library"
+#property description "ALL Array Access Points Protected"
+
+//+------------------------------------------------------------------+
+//| Include Directives                                               |
+//+------------------------------------------------------------------+
+#include <Trade\Trade.mqh>
+#include <Trade\SymbolInfo.mqh>
+#include <Trade\PositionInfo.mqh>
+#include <PriceAction.mqh>
+
+//+------------------------------------------------------------------+
+//| EA-Specific Input Parameters                                     |
+//+------------------------------------------------------------------+
+sinput string            SEP1                = "=== Point of Interest ===";
+input bool               UsePivotPoint      = true;           // Use Pivot Point as key level
+input bool               UseVWAP            = false;          // Use VWAP as key level
+input ENUM_TIMEFRAMES    KeyLevelTimeframe  = PERIOD_D1;      // Timeframe for key level calculation
+
+sinput string            SEP2                = "=== Position Limits ===";
+input int                MaxPositionsPerSymbol = 1;           // Max positions per symbol
+input int                MaxTotalPositions  = 3;              // Max total positions across all symbols
+
+sinput string            SEP3                = "=== Pattern Requirements ===";
+input bool               RequireRejectionPattern = true;      // Require price rejection pattern
+input double             KeyLevelTolerance  = 5.0;           // Key level proximity (pips)
+
+sinput string            SEP4                = "=== Trading Cooldown ===";
+input int                MinutesBetweenTrades = 5;            // Minimum minutes between trades per symbol
+
+//+------------------------------------------------------------------+
+//| Symbol Configuration Structure                                    |
+//+------------------------------------------------------------------+
+struct SymbolConfig
+{
+    string   symbol;
+    double   multiplier;
+    double   maxSpread;
+    bool     isActive;
+    
+    // Trading state
+    double   pivotPoint;
+    double   vwap;
+    double   keyLevel;
+    double   pointOfInterest;
+    bool     hasPosition;
+    datetime lastTradeTime;
+};
+
+//+------------------------------------------------------------------+
+//| Global Variables                                                  |
+//+------------------------------------------------------------------+
+SymbolConfig    g_symbols[];
+CPositionInfo   g_positionInfo;
+int             g_totalPositions = 0;
+bool            g_isFullyInitialized = false;
+bool            g_initializationFailed = false;
+
+//+------------------------------------------------------------------+
+//| BULLETPROOF: Validate Index Before ANY Array Access              |
+//+------------------------------------------------------------------+
+bool IsValidIndex(int index, string functionName = "")
+{
+    int arraySize = ArraySize(g_symbols);
+    
+    if(index < 0)
+    {
+        PrintFormat("ERROR [%s]: Negative index %d", functionName, index);
+        return false;
+    }
+    
+    if(index >= arraySize)
+    {
+        PrintFormat("ERROR [%s]: Index %d >= array size %d", functionName, index, arraySize);
+        return false;
+    }
+    
+    if(index >= g_symbolCount)
+    {
+        PrintFormat("ERROR [%s]: Index %d >= symbol count %d", functionName, index, g_symbolCount);
+        return false;
+    }
+    
+    return true;
+}
+
+//+------------------------------------------------------------------+
+//| OnInit - Robust Initialization                                   |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+    g_symbolCount = 0;
+    g_isFullyInitialized = false;
+    g_initializationFailed = false;
+    g_totalPositions = 0;
+    
+    ArrayResize(g_symbols, 0);
+    
+    Print("========================================");
+    Print("Starting EA Initialization...");
+    Print("========================================");
+    
+    Print("Step 1: Initializing PriceAction library...");
+    if(!InitializePriceAction())
+    {
+        Print("ERROR: Failed to initialize PriceAction library");
+        g_initializationFailed = true;
+        return INIT_FAILED;
+    }
+    Print("✓ PriceAction library initialized");
+    
+    Print("Step 2: Configuring EA symbols array...");
+    if(!ConfigureSymbols())
+    {
+        Print("ERROR: Failed to configure symbols");
+        g_symbolCount = 0;
+        g_initializationFailed = true;
+        return INIT_FAILED;
+    }
+    
+    if(g_symbolCount != ArraySize(g_symbols) || g_symbolCount == 0)
+    {
+        PrintFormat("CRITICAL ERROR: EA array mismatch - Count: %d, Size: %d", 
+                   g_symbolCount, ArraySize(g_symbols));
+        g_symbolCount = 0;
+        g_initializationFailed = true;
+        return INIT_FAILED;
+    }
+    
+    PrintFormat("✓ EA symbols configured: %d symbols, array size: %d", 
+               g_symbolCount, ArraySize(g_symbols));
+    
+    Print("Step 3: Pre-loading symbols and historical data...");
+    for(int i = 0; i < g_symbolCount; i++)
+    {
+        if(!IsValidIndex(i, "OnInit-PreLoad"))
+            continue;
+            
+        string symbol = g_symbols[i].symbol;
+        
+        PrintFormat("  [%d/%d] Loading %s...", i+1, g_symbolCount, symbol);
+        
+        if(!SymbolSelect(symbol, true))
+        {
+            PrintFormat("    ⚠️ Adding %s to Market Watch...", symbol);
+            SymbolSelect(symbol, true);
+        }
+        
+        int bars = Bars(symbol, ATRTimeframe);
+        
+        if(bars < ATRPeriod + 10)
+        {
+            PrintFormat("    ⚠️ Loading historical data for %s...", symbol);
+            
+            datetime time = iTime(symbol, ATRTimeframe, ATRPeriod + 20);
+            double high = iHigh(symbol, ATRTimeframe, 10);
+            double low = iLow(symbol, ATRTimeframe, 10);
+            
+            Sleep(200);
+            
+            bars = Bars(symbol, ATRTimeframe);
+            PrintFormat("    → Now have %d bars for %s", bars, symbol);
+        }
+        else
+        {
+            PrintFormat("    ✓ %s has sufficient data (%d bars)", symbol, bars);
+        }
+    }
+    
+    Print("✓ Historical data loaded");
+    Sleep(500);
+    
+    Print("Step 4: Initializing symbols in PriceAction library...");
+    int activeCount = 0;
+    
+    for(int i = 0; i < g_symbolCount; i++)
+    {
+        if(!IsValidIndex(i, "OnInit-LibraryInit"))
+            continue;
+            
+        PrintFormat("  [%d/%d] Initializing %s in library...", 
+                   i+1, g_symbolCount, g_symbols[i].symbol);
+        
+        if(InitializeSymbol(g_symbols[i].symbol, g_symbols[i].multiplier, g_symbols[i].maxSpread))
+        {
+            g_symbols[i].isActive = true;
+            activeCount++;
+            PrintFormat("    ✓ %s initialized", g_symbols[i].symbol);
+        }
+        else
+        {
+            PrintFormat("    ❌ Failed to initialize %s", g_symbols[i].symbol);
+            g_symbols[i].isActive = false;
+        }
+    }
+    
+    if(activeCount == 0)
+    {
+        Print("ERROR: No symbols initialized in library");
+        g_symbolCount = 0;
+        g_initializationFailed = true;
+        return INIT_FAILED;
+    }
+    
+    PrintFormat("✓ Library symbols initialized: %d / %d", activeCount, g_symbolCount);
+    Sleep(500);
+    
+    Print("Step 5: Setting up ATR indicators...");
+    if(!InitializeATRHandles())
+    {
+        Print("WARNING: ATR setup incomplete - will lazy load on first use");
+    }
+    else
+    {
+        Print("✓ ATR indicators ready");
+    }
+    
+    Print("Step 6: Configuring trading parameters...");
+    g_trade.SetExpertMagicNumber(123456);
+    g_trade.SetDeviationInPoints(10);
+    g_trade.SetTypeFilling(ORDER_FILLING_IOC);
+    Print("✓ Trading configured");
+    
+    EventSetTimer(30);
+    Print("✓ Timer started");
+    
+    g_isFullyInitialized = true;
+    
+    Print("========================================");
+    Print("✅ L'ACTION DE PRIX EA READY");
+    Print("========================================");
+    PrintFormat("  Active Symbols: %d / %d", activeCount, g_symbolCount);
+    PrintFormat("  Risk: %.2f%% | R:R: %.1f:1", RiskPercentage, RiskRewardRatio);
+    Print("========================================");
+    
+    return INIT_SUCCEEDED;
+}
+
+//+------------------------------------------------------------------+
+//| OnDeinit - Safe Cleanup                                          |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+    g_isFullyInitialized = false;
+    
+    ReleaseATRHandles();
+    DeinitializePriceAction();
+    EventKillTimer();
+    
+    g_symbolCount = 0;
+    ArrayResize(g_symbols, 0);
+    
+    string reasonText = GetDeinitReasonText(reason);
+    PrintFormat("EA Deinitialized: %s", reasonText);
+}
+
+//+------------------------------------------------------------------+
+//| OnTimer - Safe Processing                                        |
+//+------------------------------------------------------------------+
+void OnTimer()
+{
+    if(g_initializationFailed || !g_isFullyInitialized)
+        return;
+    
+    if(g_symbolCount <= 0 || g_symbolCount > ArraySize(g_symbols))
+        return;
+    
+    CheckNewsImpact();
+    ProcessAllSymbols();
+    
+    int arraySize = ArraySize(g_symbols);
+    for(int i = 0; i < g_symbolCount && i < arraySize; i++)
+    {
+        if(!IsValidIndex(i, "OnTimer"))
+            continue;
+            
+        if(!g_symbols[i].isActive)
+            continue;
+            
+        CalculateKeyLevels(i);
+        CalculatePointOfInterest(i);
+    }
+}
+
+//+------------------------------------------------------------------+
+//| OnTick - Bulletproof Tick Processing                             |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+    if(g_initializationFailed || !g_isFullyInitialized)
+        return;
+    
+    if(g_symbolCount <= 0)
+        return;
+    
+    int arraySize = ArraySize(g_symbols);
+    if(arraySize <= 0 || g_symbolCount > arraySize)
+        return;
+    
+    g_totalPositions = GetActivePositionsCount();
+    
+    if(g_totalPositions >= MaxTotalPositions)
+        return;
+    
+    for(int i = 0; i < g_symbolCount && i < arraySize; i++)
+    {
+        if(!IsValidIndex(i, "OnTick"))
+            continue;
+            
+        if(!g_symbols[i].isActive)
+            continue;
+        
+        string symbol = g_symbols[i].symbol;
+        
+        if(symbol == "" || symbol == NULL)
+            continue;
+        
+        int posCount = GetActivePositionsCount(symbol);
+        g_symbols[i].hasPosition = (posCount >= MaxPositionsPerSymbol);
+        
+        if(g_symbols[i].hasPosition)
+        {
+            ModifyTrade(symbol);
+            continue;
+        }
+        
+        CalculateKeyLevels(i);
+        CalculatePointOfInterest(i);
+        
+        ProcessSymbol(symbol, g_symbols[i].pointOfInterest);
+        
+        if(!IsTradingAllowed(symbol))
+            continue;
+        
+        if(!CheckTradeCooldown(i))
+            continue;
+        
+        int signal = GetTradingSignal(symbol);
+        
+        if(signal == 0)
+            continue;
+        
+        if(!ValidateSignalWithKeyLevel(i, signal))
+            continue;
+        
+        if(ExecuteTrade(symbol, signal))
+        {
+            g_symbols[i].lastTradeTime = TimeCurrent();
+            g_totalPositions++;
+        }
+    }
+}
+
+//+------------------------------------------------------------------+
+//| OnTrade - Safe Trade Event Processing                            |
+//+------------------------------------------------------------------+
+void OnTrade()
+{
+    if(g_initializationFailed || !g_isFullyInitialized)
+        return;
+    
+    g_totalPositions = GetActivePositionsCount();
+    
+    if(g_symbolCount <= 0 || g_symbolCount > ArraySize(g_symbols))
+        return;
+    
+    int arraySize = ArraySize(g_symbols);
+    
+    for(int i = 0; i < g_symbolCount && i < arraySize; i++)
+    {
+        if(!IsValidIndex(i, "OnTrade"))
+            continue;
+            
+        if(!g_symbols[i].isActive)
+            continue;
+        
+        string symbol = g_symbols[i].symbol;
+        
+        if(symbol == "" || symbol == NULL)
+            continue;
+        
+        int posCount = GetActivePositionsCount(symbol);
+        bool hadPosition = g_symbols[i].hasPosition;
+        g_symbols[i].hasPosition = (posCount > 0);
+        
+        if(posCount == 0 && hadPosition)
+        {
+            LogDebug(StringFormat("%s: Position closed", symbol));
+        }
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Configure Symbols - Safe Array Initialization                    |
+//+------------------------------------------------------------------+
+bool ConfigureSymbols()
+{
+    string symbols[] = {"EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD", "NZDUSD"};
+    double multipliers[] = {10000, 10000, 100, 10000, 10000, 10000};
+    double maxSpreads[] = {0.00030, 0.00035, 0.040, 0.00030, 0.00030, 0.00035};
+    
+    int count = ArraySize(symbols);
+    
+    if(count == 0)
+    {
+        Print("ERROR: No symbols defined");
+        return false;
+    }
+    
+    ArrayResize(g_symbols, 0);
+    
+    if(ArrayResize(g_symbols, count) != count)
+    {
+        PrintFormat("ERROR: Failed to resize EA array to %d", count);
+        return false;
+    }
+    
+    if(ArraySize(g_symbols) != count)
+    {
+        PrintFormat("ERROR: Size mismatch - expected %d, got %d", 
+                   count, ArraySize(g_symbols));
+        return false;
+    }
+    
+    g_symbolCount = count;
+    
+    for(int i = 0; i < g_symbolCount; i++)
+    {
+        g_symbols[i].symbol = symbols[i];
+        g_symbols[i].multiplier = multipliers[i];
+        g_symbols[i].maxSpread = maxSpreads[i];
+        g_symbols[i].isActive = false;
+        g_symbols[i].pivotPoint = 0.0;
+        g_symbols[i].vwap = 0.0;
+        g_symbols[i].keyLevel = 0.0;
+        g_symbols[i].pointOfInterest = 0.0;
+        g_symbols[i].hasPosition = false;
+        g_symbols[i].lastTradeTime = 0;
+    }
+    
+    PrintFormat("✓ EA array configured: %d symbols", g_symbolCount);
+    return true;
+}
+
+//+------------------------------------------------------------------+
+//| Calculate Key Levels - BULLETPROOF                               |
+//+------------------------------------------------------------------+
+void CalculateKeyLevels(int index)
+{
+    if(!IsValidIndex(index, "CalculateKeyLevels"))
+        return;
+    
+    string symbol = g_symbols[index].symbol;
+    
+    if(symbol == "" || symbol == NULL)
+    {
+        PrintFormat("ERROR [CalculateKeyLevels]: Empty symbol at index %d", index);
+        return;
+    }
+    
+    double high = iHigh(symbol, KeyLevelTimeframe, 1);
+    double low = iLow(symbol, KeyLevelTimeframe, 1);
+    double close = iClose(symbol, KeyLevelTimeframe, 1);
+    double open = iOpen(symbol, KeyLevelTimeframe, 1);
+    
+    if(high <= 0 || low <= 0 || close <= 0 || open <= 0)
+    {
+        LogDebug(StringFormat("%s: Failed to retrieve price data", symbol));
+        return;
+    }
+    
+    g_symbols[index].pivotPoint = (high + low + close) / 3.0;
+    g_symbols[index].vwap = (high + low + close + open) / 4.0;
+    
+    if(UsePivotPoint && UseVWAP)
+        g_symbols[index].keyLevel = (g_symbols[index].pivotPoint + g_symbols[index].vwap) / 2.0;
+    else if(UsePivotPoint)
+        g_symbols[index].keyLevel = g_symbols[index].pivotPoint;
+    else if(UseVWAP)
+        g_symbols[index].keyLevel = g_symbols[index].vwap;
+    else
+        g_symbols[index].keyLevel = g_symbols[index].pivotPoint;
+    
+    if(symbol == _Symbol && g_symbols[index].keyLevel > 0)
+    {
+        string lineName = "KeyLevel_" + symbol;
+        ObjectDelete(0, lineName);
+        
+        ObjectCreate(0, lineName, OBJ_HLINE, 0, 0, g_symbols[index].keyLevel);
+        ObjectSetInteger(0, lineName, OBJPROP_COLOR, clrDodgerBlue);
+        ObjectSetInteger(0, lineName, OBJPROP_STYLE, STYLE_DASHDOTDOT);
+        ObjectSetInteger(0, lineName, OBJPROP_WIDTH, 2);
+        ObjectSetString(0, lineName, OBJPROP_TEXT, "Key Level");
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Find Fibonacci Nearest to Key Level - BULLETPROOF                |
+//+------------------------------------------------------------------+
+double FindNearestFibToKeyLevel(int index)
+{
+    if(!IsValidIndex(index, "FindNearestFibToKeyLevel"))
+        return 0.0;
+    
+    string symbol = g_symbols[index].symbol;
+    double keyLevel = g_symbols[index].keyLevel;
+    
+    if(keyLevel <= 0)
+    {
+        LogDebug(StringFormat("%s: Invalid key level", symbol));
+        return 0.0;
+    }
+    
+    int symIndex = GetSymbolIndex(symbol);
+    if(symIndex < 0 || symIndex >= MAX_SYMBOLS)
+    {
+        LogDebug(StringFormat("%s: Invalid symbol index %d", symbol, symIndex));
+        return 0.0;
+    }
+    
+    FibonacciData fibData = g_symbolData[symIndex].fibData;
+    
+    if(!fibData.isValid)
+    {
+        LogDebug(StringFormat("%s: No valid Fibonacci data", symbol));
+        return 0.0;
+    }
+    
+    double fibLevels[5];
+    fibLevels[0] = fibData.fib236;
+    fibLevels[1] = fibData.fib382;
+    fibLevels[2] = fibData.fib500;
+    fibLevels[3] = fibData.fib618;
+    fibLevels[4] = fibData.fib786;
+    
+    double nearestFib = 0.0;
+    double minDistance = DBL_MAX;
+    string nearestLevelName = "";
+    string levelNames[] = {"23.6%", "38.2%", "50.0%", "61.8%", "78.6%"};
+    
+    for(int i = 0; i < 5; i++)
+    {
+        if(fibLevels[i] <= 0)
+            continue;
+            
+        double distance = MathAbs(fibLevels[i] - keyLevel);
+        
+        if(distance < minDistance)
+        {
+            minDistance = distance;
+            nearestFib = fibLevels[i];
+            nearestLevelName = levelNames[i];
+        }
+    }
+    
+    if(nearestFib > 0)
+    {
+        LogDebug(StringFormat("%s: Nearest Fib %s at %.5f (distance: %.5f)",
+                             symbol, nearestLevelName, nearestFib, minDistance));
+    }
+    
+    return nearestFib;
+}
+
+//+------------------------------------------------------------------+
+//| Calculate Point of Interest - BULLETPROOF                        |
+//+------------------------------------------------------------------+
+void CalculatePointOfInterest(int index)
+{
+    if(!IsValidIndex(index, "CalculatePointOfInterest"))
+        return;
+    
+    string symbol = g_symbols[index].symbol;
+    double keyLevel = g_symbols[index].keyLevel;
+    
+    if(keyLevel <= 0)
+    {
+        g_symbols[index].pointOfInterest = 0.0;
+        return;
+    }
+    
+    double nearestFib = FindNearestFibToKeyLevel(index);
+    
+    if(nearestFib <= 0)
+    {
+        g_symbols[index].pointOfInterest = keyLevel;
+        LogDebug(StringFormat("%s: Using KeyLevel %.5f as POI", symbol, keyLevel));
+        return;
+    }
+    
+    g_symbols[index].pointOfInterest = (keyLevel + nearestFib) / 2.0;
+    
+    PrintFormat("🎯 %s: POI = %.5f (KeyLevel: %.5f + Fib: %.5f)",
+               symbol, g_symbols[index].pointOfInterest, keyLevel, nearestFib);
+    
+    if(symbol == _Symbol && g_symbols[index].pointOfInterest > 0)
+    {
+        string lineName = "PointOfInterest_" + symbol;
+        ObjectDelete(0, lineName);
+        
+        ObjectCreate(0, lineName, OBJ_HLINE, 0, 0, g_symbols[index].pointOfInterest);
+        ObjectSetInteger(0, lineName, OBJPROP_COLOR, clrOrange);
+        ObjectSetInteger(0, lineName, OBJPROP_STYLE, STYLE_SOLID);
+        ObjectSetInteger(0, lineName, OBJPROP_WIDTH, 3);
+        ObjectSetString(0, lineName, OBJPROP_TEXT, "Point of Interest");
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Validate Signal with Key Level - BULLETPROOF                     |
+//+------------------------------------------------------------------+
+bool ValidateSignalWithKeyLevel(int index, int signal)
+{
+    if(!IsValidIndex(index, "ValidateSignalWithKeyLevel"))
+        return false;
+    
+    string symbol = g_symbols[index].symbol;
+    double pointOfInterest = g_symbols[index].pointOfInterest;
+    
+    if(pointOfInterest <= 0)
+    {
+        LogDebug(StringFormat("%s: No valid POI", symbol));
+        return false;
+    }
+    
+    if(!IsPriceNearLevel(symbol, pointOfInterest, KeyLevelTolerance))
+    {
+        LogDebug(StringFormat("%s: Price not near POI %.5f", symbol, pointOfInterest));
+        return false;
+    }
+    
+    if(RequireRejectionPattern)
+    {
+        RejectionSignal rejection = PricePosition(symbol, pointOfInterest, PatternTimeframe);
+        
+        if(signal == 1)
+        {
+            if(!rejection.isBullishRejection)
+            {
+                LogDebug(StringFormat("%s: No bullish rejection", symbol));
+                return false;
+            }
+            
+            PrintFormat("✅ %s: Bullish rejection at POI %.5f - %s", 
+                       symbol, pointOfInterest, rejection.rejectionType);
+        }
+        else if(signal == -1)
+        {
+            if(!rejection.isBearishRejection)
+            {
+                LogDebug(StringFormat("%s: No bearish rejection", symbol));
+                return false;
+            }
+            
+            PrintFormat("✅ %s: Bearish rejection at POI %.5f - %s", 
+                       symbol, pointOfInterest, rejection.rejectionType);
+        }
+    }
+    
+    return true;
+}
+
+//+------------------------------------------------------------------+
+//| Check Trade Cooldown - BULLETPROOF                               |
+//+------------------------------------------------------------------+
+bool CheckTradeCooldown(int index)
+{
+    if(!IsValidIndex(index, "CheckTradeCooldown"))
+        return false;
+    
+    if(g_symbols[index].lastTradeTime == 0)
+        return true;
+        
+    datetime timeSinceLast = TimeCurrent() - g_symbols[index].lastTradeTime;
+    int cooldownSeconds = MinutesBetweenTrades * 60;
+    
+    if(timeSinceLast < cooldownSeconds)
+    {
+        LogDebug(StringFormat("%s: Cooldown active - %d seconds remaining",
+                             g_symbols[index].symbol,
+                             cooldownSeconds - (int)timeSinceLast));
+        return false;
+    }
+    
+    return true;
+}
+
+//+------------------------------------------------------------------+
+//| Get Deinitialization Reason Text                                 |
+//+------------------------------------------------------------------+
+string GetDeinitReasonText(int reason)
+{
+    switch(reason)
+    {
+        case REASON_REMOVE:      return "EA removed by user";
+        case REASON_RECOMPILE:   return "EA recompiled";
+        case REASON_CHARTCHANGE: return "Chart changed";
+        case REASON_CHARTCLOSE:  return "Chart closed";
+        case REASON_PARAMETERS:  return "Parameters changed";
+        case REASON_ACCOUNT:     return "Account changed";
+        case REASON_TEMPLATE:    return "Template applied";
+        case REASON_INITFAILED:  return "Initialization failed";
+        case REASON_CLOSE:       return "Terminal closed";
+        default:                 return "Unknown reason";
+    }
+}
+//+------------------------------------------------------------------+
