@@ -65,12 +65,17 @@ CTrade          g_trade;
 CSymbolInfo     g_symbolInfo; */
 CPositionInfo   g_positionInfo;
 int             g_totalPositions = 0;
+bool            g_isFullyInitialized = false;
 
 //+------------------------------------------------------------------+
-//| Expert Initialization Function - PRODUCTION READY                |
+//| Expert Initialization Function - SAFE VERSION                    |
 //+------------------------------------------------------------------+
 int OnInit()
 {
+    // CRITICAL: Reset everything before starting
+    g_symbolCount = 0;
+    g_isFullyInitialized = false;
+    
     Print("========================================");
     Print("Starting EA Initialization...");
     Print("========================================");
@@ -89,8 +94,19 @@ int OnInit()
     if(!ConfigureSymbols())
     {
         Print("ERROR: Failed to configure symbols");
+        g_symbolCount = 0;  // Reset on failure
         return INIT_FAILED;
     }
+    
+    // Verify array and count match
+    if(g_symbolCount != ArraySize(g_symbols))
+    {
+        PrintFormat("CRITICAL ERROR: Count mismatch - g_symbolCount: %d, ArraySize: %d", 
+                   g_symbolCount, ArraySize(g_symbols));
+        g_symbolCount = 0;
+        return INIT_FAILED;
+    }
+    
     Print("✓ Symbols configured");
     
     // STEP 3: Pre-load symbols and historical data
@@ -108,14 +124,13 @@ int OnInit()
             SymbolSelect(symbol, true);
         }
         
-        // Force load historical data by accessing bars
+        // Force load historical data
         int bars = Bars(symbol, ATRTimeframe);
         
         if(bars < ATRPeriod + 10)
         {
             PrintFormat("    ⚠️ Loading historical data for %s (current: %d bars)...", symbol, bars);
             
-            // Trigger data loading
             datetime time = iTime(symbol, ATRTimeframe, ATRPeriod + 20);
             double high = iHigh(symbol, ATRTimeframe, 10);
             double low = iLow(symbol, ATRTimeframe, 10);
@@ -133,7 +148,7 @@ int OnInit()
     
     Print("✓ Historical data loaded for all symbols");
     
-    // CRITICAL PAUSE: Let data settle
+    // CRITICAL PAUSE
     Print("⏳ Pausing 1 second to ensure data is ready...");
     Sleep(1000);
     
@@ -163,12 +178,13 @@ int OnInit()
         Print("========================================");
         Print("ERROR: No symbols initialized in library");
         Print("========================================");
+        g_symbolCount = 0;
         return INIT_FAILED;
     }
     
     PrintFormat("✓ Symbols initialized: %d / %d", activeCount, g_symbolCount);
     
-    // CRITICAL PAUSE: Ensure library symbols array is populated
+    // CRITICAL PAUSE
     Print("⏳ Pausing 500ms before creating ATR handles...");
     Sleep(500);
     
@@ -202,6 +218,9 @@ int OnInit()
     EventSetTimer(30);
     Print("✓ Timer started (30 seconds)");
     
+    // FINAL STEP: Mark as fully initialized
+    g_isFullyInitialized = true;
+    
     // Final summary
     Print("========================================");
     Print("✓ L'ACTION DE PRIX EA v3.01 READY");
@@ -218,6 +237,7 @@ int OnInit()
     
     return INIT_SUCCEEDED;
 }
+
 
 //+------------------------------------------------------------------+
 //| Expert Deinitialization Function                                  |
@@ -238,30 +258,43 @@ void OnDeinit(const int reason)
     PrintFormat("EA Deinitialized: %s", reasonText);
 }
 
+
 //+------------------------------------------------------------------+
-//| Timer Event Function - WITH BOUNDS CHECKING                      |
+//| Timer Event Function - SAFE VERSION                              |
 //+------------------------------------------------------------------+
 void OnTimer()
 {
-    CheckNewsImpact();
-    ProcessAllSymbols();
-    
-    // Validate symbol count
-    if(g_symbolCount <= 0 || g_symbolCount > ArraySize(g_symbols))
+    // CRITICAL: Don't run until fully initialized
+    if(!g_isFullyInitialized)
     {
-        PrintFormat("ERROR: Invalid g_symbolCount: %d (array size: %d)", 
-                   g_symbolCount, ArraySize(g_symbols));
         return;
     }
     
-    // Update key levels with bounds checking
+    CheckNewsImpact();
+    ProcessAllSymbols();
+    
+    // Double-check symbolCount is valid
+    if(g_symbolCount <= 0)
+    {
+        return;
+    }
+    
+    // Triple-check against array size
+    int arraySize = ArraySize(g_symbols);
+    if(arraySize <= 0 || g_symbolCount > arraySize)
+    {
+        PrintFormat("ERROR: Invalid state - g_symbolCount: %d, array size: %d", 
+                   g_symbolCount, arraySize);
+        return;
+    }
+    
+    // NOW it's safe to loop
     for(int i = 0; i < g_symbolCount; i++)
     {
-        // Validate index before processing
-        if(i < 0 || i >= ArraySize(g_symbols))
+        // One final safety check per iteration
+        if(i >= arraySize)
         {
-            PrintFormat("ERROR: Invalid array access in OnTimer, index: %d, array size: %d", 
-                       i, ArraySize(g_symbols));
+            PrintFormat("ERROR: Loop index %d >= array size %d", i, arraySize);
             break;
         }
         
@@ -274,10 +307,16 @@ void OnTimer()
 }
 
 //+------------------------------------------------------------------+
-//| Tick Event Function - WITH BOUNDS CHECKING                       |
+//| Tick Event Function - SAFE VERSION                               |
 //+------------------------------------------------------------------+
 void OnTick()
 {
+    // CRITICAL: Don't run until fully initialized
+    if(!g_isFullyInitialized)
+    {
+        return;
+    }
+    
     // Update total positions count
     g_totalPositions = GetActivePositionsCount();
     
@@ -286,20 +325,27 @@ void OnTick()
         return;
     
     // Validate g_symbolCount
-    if(g_symbolCount <= 0 || g_symbolCount > ArraySize(g_symbols))
+    if(g_symbolCount <= 0)
     {
-        PrintFormat("ERROR: Invalid g_symbolCount: %d (array size: %d)", 
-                   g_symbolCount, ArraySize(g_symbols));
+        return;
+    }
+    
+    // Validate against array size
+    int arraySize = ArraySize(g_symbols);
+    if(arraySize <= 0 || g_symbolCount > arraySize)
+    {
+        PrintFormat("ERROR: Invalid state in OnTick - g_symbolCount: %d, array size: %d", 
+                   g_symbolCount, arraySize);
         return;
     }
     
     // Process each symbol
     for(int i = 0; i < g_symbolCount; i++)
     {
-        // Validate index before each operation
-        if(i < 0 || i >= ArraySize(g_symbols))
+        // Safety check per iteration
+        if(i >= arraySize)
         {
-            PrintFormat("ERROR: Invalid array access in OnTick, index: %d", i);
+            PrintFormat("ERROR: Loop index %d >= array size %d in OnTick", i, arraySize);
             break;
         }
         
@@ -361,7 +407,7 @@ void OnTick()
 }
 
 //+------------------------------------------------------------------+
-//| Configure Trading Symbols                                        |
+//| Configure Trading Symbols - SAFE VERSION                         |
 //+------------------------------------------------------------------+
 bool ConfigureSymbols()
 {
@@ -370,16 +416,33 @@ bool ConfigureSymbols()
     double multipliers[] = {10000, 10000, 100, 10000, 10000, 10000};
     double maxSpreads[] = {0.00030, 0.00035, 0.040, 0.00030, 0.00030, 0.00035};
     
-    g_symbolCount = ArraySize(symbols);
+    int symbolsToAdd = ArraySize(symbols);
     
-    if(g_symbolCount == 0)
+    if(symbolsToAdd == 0)
     {
         Print("ERROR: No symbols defined");
         return false;
     }
     
-    ArrayResize(g_symbols, g_symbolCount);
+    // CRITICAL: Resize array BEFORE setting count
+    if(ArrayResize(g_symbols, symbolsToAdd) != symbolsToAdd)
+    {
+        PrintFormat("ERROR: Failed to resize g_symbols array to %d", symbolsToAdd);
+        return false;
+    }
     
+    // Verify resize succeeded
+    if(ArraySize(g_symbols) != symbolsToAdd)
+    {
+        PrintFormat("ERROR: Array size mismatch after resize - expected: %d, got: %d", 
+                   symbolsToAdd, ArraySize(g_symbols));
+        return false;
+    }
+    
+    // NOW set the count
+    g_symbolCount = symbolsToAdd;
+    
+    // Initialize each symbol
     for(int i = 0; i < g_symbolCount; i++)
     {
         g_symbols[i].symbol = symbols[i];
@@ -393,6 +456,8 @@ bool ConfigureSymbols()
         g_symbols[i].hasPosition = false;
         g_symbols[i].lastTradeTime = 0;
     }
+    
+    PrintFormat("✓ Configured %d symbols, array size: %d", g_symbolCount, ArraySize(g_symbols));
     
     return true;
 }
