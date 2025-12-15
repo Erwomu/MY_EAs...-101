@@ -1,0 +1,50 @@
+//+------------------------------------------------------------------+
+//| Configure Trading Symbols - FIXED VERSION                        |
+//+------------------------------------------------------------------+
+bool ConfigureSymbols()
+{
+    // Define symbols to trade
+    string symbols[] = {"EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD", "NZDUSD"};
+    double multipliers[] = {10000, 10000, 100, 10000, 10000, 10000};
+    double maxSpreads[] = {0.00030, 0.00035, 0.040, 0.00030, 0.00030, 0.00035};
+    
+    int symbolsToAdd = ArraySize(symbols);
+    
+    if(symbolsToAdd == 0)
+    {
+        Print("ERROR: No symbols defined");
+        return false;
+    }
+    
+    // CRITICAL FIX: Resize array FIRST, then set count
+    ArrayResize(g_symbols, symbolsToAdd);
+    
+    // Verify resize succeeded
+    if(ArraySize(g_symbols) != symbolsToAdd)
+    {
+        PrintFormat("ERROR: Failed to resize g_symbols array to %d", symbolsToAdd);
+        return false;
+    }
+    
+    // NOW set the count (after array is sized)
+    g_symbolCount = symbolsToAdd;
+    
+    // Initialize each symbol
+    for(int i = 0; i < g_symbolCount; i++)
+    {
+        g_symbols[i].symbol = symbols[i];
+        g_symbols[i].multiplier = multipliers[i];
+        g_symbols[i].maxSpread = maxSpreads[i];
+        g_symbols[i].isActive = false;
+        g_symbols[i].pivotPoint = 0.0;
+        g_symbols[i].vwap = 0.0;
+        g_symbols[i].keyLevel = 0.0;
+        g_symbols[i].pointOfInterest = 0.0;
+        g_symbols[i].hasPosition = false;
+        g_symbols[i].lastTradeTime = 0;
+    }
+    
+    PrintFormat("✓ Configured %d symbols successfully", g_symbolCount);
+    
+    return true;
+}
