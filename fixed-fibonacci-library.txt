@@ -1,0 +1,276 @@
+//+------------------------------------------------------------------+
+//| REPLACE THIS SECTION IN PriceAction.mqh                          |
+//| Find the CalculatePolishedFibonacci function and replace it      |
+//+------------------------------------------------------------------+
+
+//+------------------------------------------------------------------+
+//| Calculate Fibonacci Retracement - FIXED VALIDATION               |
+//+------------------------------------------------------------------+
+FibonacciData CalculatePolishedFibonacci(const string symbol,
+                                         ENUM_TIMEFRAMES timeframe = PERIOD_H4,
+                                         int maxLookback = 100,        // INCREASED from 50
+                                         int confirmBars = 2,
+                                         int maxSwingAge = 100,        // INCREASED from 50
+                                         double minRangeATR = 0.5)     // DECREASED from 1.5
+{
+    FibonacciData fib;
+    fib.Reset();
+    
+    // Get ATR
+    int atrHandle = iATR(symbol, timeframe, 14);
+    if(atrHandle == INVALID_HANDLE)
+    {
+        fib.invalidReason = "Failed to create ATR indicator";
+        Print("ERROR: ", fib.invalidReason, " for ", symbol);
+        return fib;
+    }
+    
+    double atrBuffer[];
+    double atr = 0;
+    
+    if(CopyBuffer(atrHandle, 0, 0, 1, atrBuffer) <= 0)
+    {
+        fib.invalidReason = "Failed to copy ATR buffer";
+        Print("ERROR: ", fib.invalidReason, " for ", symbol);
+        IndicatorRelease(atrHandle);
+        return fib;
+    }
+    
+    atr = atrBuffer[0];
+    
+    if(atr <= 0 || atr > 1000000)
+    {
+        fib.invalidReason = StringFormat("Invalid ATR value: %.5f", atr);
+        Print("ERROR: ", fib.invalidReason, " for ", symbol);
+        IndicatorRelease(atrHandle);
+        return fib;
+    }
+    
+    // Get current price
+    double close[];
+    if(CopyClose(symbol, timeframe, 0, 1, close) < 1)
+    {
+        fib.invalidReason = "Failed to get current price";
+        Print("ERROR: ", fib.invalidReason, " for ", symbol);
+        IndicatorRelease(atrHandle);
+        return fib;
+    }
+    fib.currentPrice = close[0];
+    
+    // Find swing highs and lows
+    if(!FindAllSwingHighs(symbol, timeframe, maxLookback, confirmBars, fib.allSwingHighs))
+    {
+        fib.invalidReason = StringFormat("No swing highs found in %d bars", maxLookback);
+        LogDebug(StringFormat("%s: %s", symbol, fib.invalidReason));
+        IndicatorRelease(atrHandle);
+        return fib;
+    }
+    
+    if(!FindAllSwingLows(symbol, timeframe, maxLookback, confirmBars, fib.allSwingLows))
+    {
+        fib.invalidReason = StringFormat("No swing lows found in %d bars", maxLookback);
+        LogDebug(StringFormat("%s: %s", symbol, fib.invalidReason));
+        IndicatorRelease(atrHandle);
+        return fib;
+    }
+    
+    LogDebug(StringFormat("%s: Found %d swing highs and %d swing lows",
+                         symbol, ArraySize(fib.allSwingHighs), ArraySize(fib.allSwingLows)));
+    
+    // Select best swing pair
+    string selectionReason;
+    if(!FindBestSwingPair(fib.allSwingHighs, fib.allSwingLows,
+                          fib.swingHigh, fib.swingLow,
+                          fib.isBullishTrend, fib.swingDistance,
+                          selectionReason))
+    {
+        fib.invalidReason = selectionReason;
+        LogDebug(StringFormat("%s: %s", symbol, fib.invalidReason));
+        IndicatorRelease(atrHandle);
+        return fib;
+    }
+    
+    LogDebug(StringFormat("%s: %s", symbol, selectionReason));
+    
+    fib.isBearishTrend = !fib.isBullishTrend;
+    
+    // Calculate range
+    fib.range = fib.swingHigh.price - fib.swingLow.price;
+    
+    // CRITICAL FIX: More lenient range validation
+    if(fib.range <= 0)
+    {
+        fib.invalidReason = StringFormat("Invalid range: %.5f (High: %.5f, Low: %.5f)",
+                                        fib.range, fib.swingHigh.price, fib.swingLow.price);
+        LogDebug(StringFormat("%s: %s", symbol, fib.invalidReason));
+        IndicatorRelease(atrHandle);
+        return fib;
+    }
+    
+    fib.rangeInATR = fib.range / atr;
+    
+    // Get current time
+    datetime time[];
+    if(CopyTime(symbol, timeframe, 0, 1, time) < 1)
+    {
+        fib.invalidReason = "Failed to get current bar time";
+        IndicatorRelease(atrHandle);
+        return fib;
+    }
+    
+    datetime currentBarTime = time[0];
+    int periodSeconds = PeriodSeconds(timeframe);
+    
+    int swingHighBarsAgo = (int)((currentBarTime - fib.swingHigh.time) / periodSeconds);
+    int swingLowBarsAgo = (int)((currentBarTime - fib.swingLow.time) / periodSeconds);
+    
+    fib.isRecent = (swingHighBarsAgo <= maxSwingAge && swingLowBarsAgo <= maxSwingAge);
+    
+    // RELAXED: Don't fail if not recent, just flag it
+    if(!fib.isRecent)
+    {
+        LogDebug(StringFormat("%s: Swings old but using anyway - High: %d bars, Low: %d bars",
+                             symbol, swingHighBarsAgo, swingLowBarsAgo));
+    }
+    
+    // RELAXED: Allow smaller ranges (0.5 ATR instead of 1.5)
+    bool significantRange = (fib.rangeInATR >= minRangeATR);
+    
+    if(!significantRange)
+    {
+        LogDebug(StringFormat("%s: Small range (%.2f ATR) but using anyway", 
+                             symbol, fib.rangeInATR));
+    }
+    
+    // RELAXED: Allow closer swings (min 2 bars instead of 5)
+    if(fib.swingDistance < 2)
+    {
+        fib.invalidReason = StringFormat("Swings too close: %d bars (min: 2)", fib.swingDistance);
+        LogDebug(StringFormat("%s: %s", symbol, fib.invalidReason));
+        IndicatorRelease(atrHandle);
+        return fib;
+    }
+    
+    // Determine trend direction
+    if(fib.isBullishTrend)
+    {
+        LogDebug(StringFormat("%s: BULLISH trend (Low bar %d -> High bar %d)",
+                             symbol, fib.swingLow.barsAgo, fib.swingHigh.barsAgo));
+    }
+    else
+    {
+        LogDebug(StringFormat("%s: BEARISH trend (High bar %d -> Low bar %d)",
+                             symbol, fib.swingHigh.barsAgo, fib.swingLow.barsAgo));
+    }
+    
+    // Calculate Fibonacci levels
+    if(fib.isBullishTrend)
+    {
+        // Bullish: retracing from high
+        fib.fib236 = fib.swingHigh.price - (fib.range * 0.236);
+        fib.fib382 = fib.swingHigh.price - (fib.range * 0.382);
+        fib.fib500 = fib.swingHigh.price - (fib.range * 0.500);
+        fib.fib618 = fib.swingHigh.price - (fib.range * 0.618);
+        fib.fib786 = fib.swingHigh.price - (fib.range * 0.786);
+        
+        fib.extension1272 = fib.swingHigh.price + (fib.range * 0.272);
+        fib.extension1618 = fib.swingHigh.price + (fib.range * 0.618);
+        fib.extension2000 = fib.swingHigh.price + fib.range;
+    }
+    else
+    {
+        // Bearish: retracing from low
+        fib.fib236 = fib.swingLow.price + (fib.range * 0.236);
+        fib.fib382 = fib.swingLow.price + (fib.range * 0.382);
+        fib.fib500 = fib.swingLow.price + (fib.range * 0.500);
+        fib.fib618 = fib.swingLow.price + (fib.range * 0.618);
+        fib.fib786 = fib.swingLow.price + (fib.range * 0.786);
+        
+        fib.extension1272 = fib.swingLow.price - (fib.range * 0.272);
+        fib.extension1618 = fib.swingLow.price - (fib.range * 0.618);
+        fib.extension2000 = fib.swingLow.price - fib.range;
+    }
+    
+    // Find nearest Fibonacci level to current price
+    fib.nearestFibLevel = FindNearestFibLevel(fib.currentPrice, fib, fib.distanceToFib);
+    fib.distanceToFib = fib.distanceToFib / atr;
+    
+    // Mark as VALID
+    fib.isValid = true;
+    
+    PrintFormat("✅ %s Fibonacci VALID", symbol);
+    PrintFormat("   Range: %.5f (%.2f ATR) | Distance: %d bars", 
+               fib.range, fib.rangeInATR, fib.swingDistance);
+    PrintFormat("   Swing High: %.5f at %s (%d bars ago)",
+               fib.swingHigh.price, TimeToString(fib.swingHigh.time), fib.swingHigh.barsAgo);
+    PrintFormat("   Swing Low: %.5f at %s (%d bars ago)",
+               fib.swingLow.price, TimeToString(fib.swingLow.time), fib.swingLow.barsAgo);
+    PrintFormat("   Trend: %s", fib.isBullishTrend ? "BULLISH" : "BEARISH");
+    PrintFormat("   Current Price: %.5f | Distance: %.2f ATR",
+               fib.currentPrice, fib.distanceToFib);
+    PrintFormat("   Key Levels -> 38.2%%: %.5f | 50%%: %.5f | 61.8%%: %.5f",
+               fib.fib382, fib.fib500, fib.fib618);
+    
+    IndicatorRelease(atrHandle);
+    
+    return fib;
+}
+
+//+------------------------------------------------------------------+
+//| Find Best Swing Pair - RELAXED VALIDATION                        |
+//+------------------------------------------------------------------+
+bool FindBestSwingPair(const SwingPoint &allHighs[], const SwingPoint &allLows[],
+                       SwingPoint &selectedHigh, SwingPoint &selectedLow,
+                       bool &isBullish, int &swingDistance, string &reason)
+{
+    int numHighs = ArraySize(allHighs);
+    int numLows = ArraySize(allLows);
+    
+    if(numHighs == 0)
+    {
+        reason = "No swing highs found";
+        return false;
+    }
+    
+    if(numLows == 0)
+    {
+        reason = "No swing lows found";
+        return false;
+    }
+    
+    // Use MOST RECENT swing high and low
+    selectedHigh = allHighs[0];
+    selectedLow = allLows[0];
+    
+    // Calculate range
+    double range = selectedHigh.price - selectedLow.price;
+    
+    // CRITICAL: Allow BOTH positive and negative ranges
+    // Negative range just means low is above high (valid for bearish)
+    if(MathAbs(range) < 0.00001)
+    {
+        reason = "Range too small (prices identical)";
+        return false;
+    }
+    
+    swingDistance = MathAbs(selectedHigh.barsAgo - selectedLow.barsAgo);
+    
+    // RELAXED: Minimum 2 bars instead of 5
+    if(swingDistance < 2)
+    {
+        reason = StringFormat("Swings too close: %d bars (min: 2)", swingDistance);
+        return false;
+    }
+    
+    // REMOVED: Max distance check - use any distance
+    
+    // Determine trend direction
+    isBullish = (selectedLow.barsAgo > selectedHigh.barsAgo);
+    
+    reason = StringFormat("Using MOST RECENT: High[0] %.5f (%d bars ago), Low[0] %.5f (%d bars ago), Range: %.5f, Distance: %d bars",
+                         selectedHigh.price, selectedHigh.barsAgo,
+                         selectedLow.price, selectedLow.barsAgo,
+                         range, swingDistance);
+    
+    return true;
+}
