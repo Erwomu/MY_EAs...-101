@@ -1,0 +1,673 @@
+//+------------------------------------------------------------------+
+//|                                              L'ACTION DE PRIX.mq5 |
+//|                                  Copyright 2025, MetaQuotes Ltd. |
+//|                                             https://www.mql5.com |
+//+------------------------------------------------------------------+
+#property copyright "Copyright 2025, MetaQuotes Ltd."
+#property link      "https://www.mql5.com"
+#property version   "3.10"
+#property description "Multi-Symbol Price Action Trading System - FINAL"
+#property description "Simple swing detection + Rejection patterns required"
+#property description "Clean, reliable, professional"
+
+//+------------------------------------------------------------------+
+//| Include Directives                                               |
+//+------------------------------------------------------------------+
+#include <Trade\Trade.mqh>
+#include <Trade\SymbolInfo.mqh>
+#include <Trade\PositionInfo.mqh>
+#include <PriceAction.mqh>
+
+//+------------------------------------------------------------------+
+//| EA-Specific Input Parameters                                     |
+//+------------------------------------------------------------------+
+sinput string            SEP1                = "=== Position Limits ===";
+input int                MaxPositionsPerSymbol = 1;           // Max positions per symbol
+input int                MaxTotalPositions  = 3;              // Max total positions across all symbols
+
+sinput string            SEP2                = "=== Trading Filters ===";
+input bool               RequireRejectionPattern = true;      // Require price rejection pattern (QUALITY FILTER)
+input double             POITolerance       = 20.0;          // POI proximity (pips)
+
+sinput string            SEP3                = "=== Trading Cooldown ===";
+input int                MinutesBetweenTrades = 30;           // Minimum minutes between trades per symbol
+
+sinput string            SEP4                = "=== Visualization ===";
+input bool               DrawFibonacci      = true;           // Draw Fibonacci retracements
+input bool               DrawZones          = true;           // Draw trading zones
+input int                ObjectRefreshSeconds = 10;           // How often to redraw objects
+input color              ZoneColor          = clrDarkSlateGray; // Zone color
+input color              POIColor382        = clrGold;        // POI 38.2% color
+input color              POIColor500        = clrOrange;      // POI 50% color
+input color              POIColor618        = clrCrimson;     // POI 61.8% color
+
+//+------------------------------------------------------------------+
+//| Symbol Configuration Structure                                    |
+//+------------------------------------------------------------------+
+struct SymbolConfig
+{
+    string   symbol;
+    double   multiplier;
+    double   maxSpread;
+    bool     isActive;
+    
+    // POI levels (3 levels)
+    double   poi382;
+    double   poi500;
+    double   poi618;
+    
+    // Trading state
+    bool     hasPosition;
+    datetime lastTradeTime;
+    datetime lastObjectDraw;
+    
+    // Cached library index
+    int      libraryIndex;
+};
+
+//+------------------------------------------------------------------+
+//| Global Variables                                                  |
+//+------------------------------------------------------------------+
+SymbolConfig    g_symbols[];
+int             g_eaSymbolCount = 0;
+CPositionInfo   g_positionInfo;
+int             g_totalPositions = 0;
+bool            g_isFullyInitialized = false;
+bool            g_initializationFailed = false;
+
+//+------------------------------------------------------------------+
+//| Validate Index                                                    |
+//+------------------------------------------------------------------+
+bool IsValidIndex(int index)
+{
+    return (index >= 0 && index < ArraySize(g_symbols) && index < g_eaSymbolCount);
+}
+
+//+------------------------------------------------------------------+
+//| OnInit                                                            |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+    g_eaSymbolCount = 0;
+    g_isFullyInitialized = false;
+    g_initializationFailed = false;
+    g_totalPositions = 0;
+    
+    ArrayResize(g_symbols, 0);
+    
+    Print("========================================");
+    Print("L'ACTION DE PRIX EA v3.10 FINAL");
+    Print("========================================");
+    
+    if(!InitializePriceAction())
+    {
+        Print("❌ Library init failed");
+        g_initializationFailed = true;
+        return INIT_FAILED;
+    }
+    
+    if(!ConfigureSymbols())
+    {
+        Print("❌ Config failed");
+        g_initializationFailed = true;
+        return INIT_FAILED;
+    }
+    
+    // Pre-load historical data
+    for(int i = 0; i < g_eaSymbolCount; i++)
+    {
+        if(!IsValidIndex(i)) continue;
+        
+        string symbol = g_symbols[i].symbol;
+        SymbolSelect(symbol, true);
+        
+        for(int retry = 0; retry < 3; retry++)
+        {
+            int bars = Bars(symbol, ATRTimeframe);
+            if(bars >= ATRPeriod + 10) break;
+            
+            iTime(symbol, ATRTimeframe, ATRPeriod + 20);
+            Sleep(300);
+        }
+    }
+    Sleep(500);
+    
+    // Initialize in library
+    int activeCount = 0;
+    for(int i = 0; i < g_eaSymbolCount; i++)
+    {
+        if(!IsValidIndex(i)) continue;
+        
+        if(InitializeSymbol(g_symbols[i].symbol, g_symbols[i].multiplier, g_symbols[i].maxSpread))
+        {
+            g_symbols[i].libraryIndex = GetSymbolIndex(g_symbols[i].symbol);
+            g_symbols[i].isActive = (g_symbols[i].libraryIndex >= 0);
+            
+            if(g_symbols[i].isActive)
+            {
+                activeCount++;
+                PrintFormat("  ✓ %s -> Lib[%d]", g_symbols[i].symbol, g_symbols[i].libraryIndex);
+            }
+        }
+    }
+    
+    if(activeCount == 0)
+    {
+        Print("❌ No active symbols");
+        g_initializationFailed = true;
+        return INIT_FAILED;
+    }
+    
+    Sleep(1000);
+    InitializeATRHandles();
+    
+    // Force create ATR handles
+    for(int i = 0; i < g_eaSymbolCount; i++)
+    {
+        if(!IsValidIndex(i)) continue;
+        if(!g_symbols[i].isActive) continue;
+        
+        int libIndex = g_symbols[i].libraryIndex;
+        if(libIndex >= 0 && libIndex < MAX_SYMBOLS)
+        {
+            GetOrCreateATRHandle(g_symbols[i].symbol, libIndex);
+        }
+    }
+    
+    g_trade.SetExpertMagicNumber(123456);
+    g_trade.SetDeviationInPoints(10);
+    g_trade.SetTypeFilling(ORDER_FILLING_IOC);
+    
+    EventSetTimer(5); // Fast timer for object refresh
+    
+    g_isFullyInitialized = true;
+    
+    Print("========================================");
+    Print("✅ EA READY TO TRADE");
+    Print("========================================");
+    PrintFormat("  Symbols: %d active", activeCount);
+    PrintFormat("  Swing Detection: Highest/Lowest in 65 bars");
+    PrintFormat("  POI Levels: 3 (38.2%%, 50%%, 61.8%%)");
+    PrintFormat("  Rejection Patterns: %s", RequireRejectionPattern ? "REQUIRED" : "Optional");
+    PrintFormat("  Cooldown: %d minutes", MinutesBetweenTrades);
+    PrintFormat("  Max Positions: %d per symbol | %d total", MaxPositionsPerSymbol, MaxTotalPositions);
+    Print("========================================");
+    
+    return INIT_SUCCEEDED;
+}
+
+//+------------------------------------------------------------------+
+//| OnDeinit                                                          |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+    g_isFullyInitialized = false;
+    
+    // Clean up all objects
+    for(int i = 0; i < g_eaSymbolCount; i++)
+    {
+        if(IsValidIndex(i))
+        {
+            string symbol = g_symbols[i].symbol;
+            ObjectDelete(0, "POI382_" + symbol);
+            ObjectDelete(0, "POI500_" + symbol);
+            ObjectDelete(0, "POI618_" + symbol);
+            ObjectDelete(0, "Zone_" + symbol);
+            
+            string prefix = "Fib_" + symbol + "_";
+            ObjectDelete(0, prefix + "Main");
+            ObjectDelete(0, prefix + "HighMarker");
+            ObjectDelete(0, prefix + "LowMarker");
+        }
+    }
+    
+    ReleaseATRHandles();
+    DeinitializePriceAction();
+    EventKillTimer();
+    
+    g_eaSymbolCount = 0;
+    ArrayResize(g_symbols, 0);
+    
+    PrintFormat("EA Deinitialized: %s", GetDeinitReasonText(reason));
+}
+
+//+------------------------------------------------------------------+
+//| OnTimer - Continuous Object Updates                              |
+//+------------------------------------------------------------------+
+void OnTimer()
+{
+    if(g_initializationFailed || !g_isFullyInitialized) return;
+    if(g_eaSymbolCount <= 0) return;
+    
+    datetime now = TimeCurrent();
+    
+    CheckNewsImpact();
+    
+    // Update all symbols
+    for(int i = 0; i < g_eaSymbolCount; i++)
+    {
+        if(!IsValidIndex(i)) continue;
+        if(!g_symbols[i].isActive) continue;
+        
+        // Throttle updates per symbol
+        if(now - g_symbols[i].lastObjectDraw < ObjectRefreshSeconds)
+            continue;
+        
+        string symbol = g_symbols[i].symbol;
+        
+        // Process and calculate
+        ProcessSymbol(symbol, 0.0);
+        CalculatePOILevels(i);
+        
+        // Draw everything
+        ForceDrawAllObjects(i);
+        
+        g_symbols[i].lastObjectDraw = now;
+    }
+}
+
+//+------------------------------------------------------------------+
+//| OnTick - Main Trading Logic                                      |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+    if(g_initializationFailed || !g_isFullyInitialized) return;
+    if(g_eaSymbolCount <= 0) return;
+    
+    g_totalPositions = GetActivePositionsCount();
+    
+    if(g_totalPositions >= MaxTotalPositions) return;
+    
+    for(int i = 0; i < g_eaSymbolCount; i++)
+    {
+        if(!IsValidIndex(i)) continue;
+        if(!g_symbols[i].isActive) continue;
+        
+        string symbol = g_symbols[i].symbol;
+        
+        // Check positions FIRST
+        int posCount = GetActivePositionsCount(symbol);
+        g_symbols[i].hasPosition = (posCount >= MaxPositionsPerSymbol);
+        
+        if(g_symbols[i].hasPosition)
+        {
+            ModifyTrade(symbol);
+            
+            // Still update visuals
+            CalculatePOILevels(i);
+            DrawPOILevels(i);
+            
+            continue;
+        }
+        
+        // Update POI levels
+        CalculatePOILevels(i);
+        DrawPOILevels(i);
+        
+        // Trading logic
+        if(!IsTradingAllowed(symbol)) continue;
+        if(!CheckTradeCooldown(i)) continue;
+        
+        int signal = GetTradingSignal(i);
+        if(signal == 0) continue;
+        
+        // Double-check no position opened
+        posCount = GetActivePositionsCount(symbol);
+        if(posCount >= MaxPositionsPerSymbol)
+        {
+            g_symbols[i].hasPosition = true;
+            continue;
+        }
+        
+        // Execute trade
+        if(ExecuteTrade(symbol, signal))
+        {
+            g_symbols[i].lastTradeTime = TimeCurrent();
+            g_symbols[i].hasPosition = true;
+            g_totalPositions = GetActivePositionsCount();
+            
+            PrintFormat("🎯 TRADE OPENED: %s %s at %.5f | POI: %.5f", 
+                       symbol, 
+                       (signal == 1 ? "BUY" : "SELL"),
+                       SymbolInfoDouble(symbol, signal == 1 ? SYMBOL_ASK : SYMBOL_BID),
+                       g_symbols[i].poi500);
+        }
+    }
+}
+
+//+------------------------------------------------------------------+
+//| OnTrade                                                           |
+//+------------------------------------------------------------------+
+void OnTrade()
+{
+    if(g_initializationFailed || !g_isFullyInitialized) return;
+    
+    g_totalPositions = GetActivePositionsCount();
+    
+    for(int i = 0; i < g_eaSymbolCount; i++)
+    {
+        if(!IsValidIndex(i)) continue;
+        if(!g_symbols[i].isActive) continue;
+        
+        string symbol = g_symbols[i].symbol;
+        int posCount = GetActivePositionsCount(symbol);
+        
+        bool hadPosition = g_symbols[i].hasPosition;
+        g_symbols[i].hasPosition = (posCount > 0);
+        
+        if(posCount == 0 && hadPosition)
+        {
+            PrintFormat("📊 TRADE CLOSED: %s", symbol);
+        }
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Configure Symbols                                                |
+//+------------------------------------------------------------------+
+bool ConfigureSymbols()
+{
+    string symbols[] = {"EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD", "NZDUSD"};
+    double multipliers[] = {10000, 10000, 100, 10000, 10000, 10000};
+    double maxSpreads[] = {0.00030, 0.00035, 0.040, 0.00030, 0.00030, 0.00040};
+    
+    int count = ArraySize(symbols);
+    if(count == 0) return false;
+    
+    if(ArrayResize(g_symbols, count) != count) return false;
+    
+    g_eaSymbolCount = count;
+    
+    for(int i = 0; i < g_eaSymbolCount; i++)
+    {
+        g_symbols[i].symbol = symbols[i];
+        g_symbols[i].multiplier = multipliers[i];
+        g_symbols[i].maxSpread = maxSpreads[i];
+        g_symbols[i].isActive = false;
+        g_symbols[i].poi382 = 0.0;
+        g_symbols[i].poi500 = 0.0;
+        g_symbols[i].poi618 = 0.0;
+        g_symbols[i].hasPosition = false;
+        g_symbols[i].lastTradeTime = 0;
+        g_symbols[i].lastObjectDraw = 0;
+        g_symbols[i].libraryIndex = -1;
+    }
+    
+    return true;
+}
+
+//+------------------------------------------------------------------+
+//| Calculate POI Levels from Fibonacci                              |
+//+------------------------------------------------------------------+
+void CalculatePOILevels(int index)
+{
+    if(!IsValidIndex(index)) return;
+    
+    int libIndex = g_symbols[index].libraryIndex;
+    
+    if(libIndex < 0 || libIndex >= MAX_SYMBOLS)
+    {
+        g_symbols[index].poi382 = 0.0;
+        g_symbols[index].poi500 = 0.0;
+        g_symbols[index].poi618 = 0.0;
+        return;
+    }
+    
+    FibonacciData fibData = g_symbolData[libIndex].fibData;
+    
+    if(!fibData.isValid)
+    {
+        g_symbols[index].poi382 = 0.0;
+        g_symbols[index].poi500 = 0.0;
+        g_symbols[index].poi618 = 0.0;
+        return;
+    }
+    
+    g_symbols[index].poi382 = fibData.fib382;
+    g_symbols[index].poi500 = fibData.fib500;
+    g_symbols[index].poi618 = fibData.fib618;
+}
+
+//+------------------------------------------------------------------+
+//| Force Draw All Objects                                           |
+//+------------------------------------------------------------------+
+void ForceDrawAllObjects(int index)
+{
+    if(!IsValidIndex(index)) return;
+    
+    DrawPOILevels(index);
+    
+    if(DrawZones)
+        DrawTradingZone(index);
+    
+    if(DrawFibonacci)
+        DrawFibonacciRetracement(index);
+}
+
+//+------------------------------------------------------------------+
+//| Draw POI Levels                                                   |
+//+------------------------------------------------------------------+
+void DrawPOILevels(int index)
+{
+    if(!IsValidIndex(index)) return;
+    
+    string symbol = g_symbols[index].symbol;
+    
+    // POI 38.2%
+    string line382 = "POI382_" + symbol;
+    if(ObjectFind(0, line382) >= 0) ObjectDelete(0, line382);
+    
+    if(g_symbols[index].poi382 > 0)
+    {
+        if(ObjectCreate(0, line382, OBJ_HLINE, 0, 0, g_symbols[index].poi382))
+        {
+            ObjectSetInteger(0, line382, OBJPROP_COLOR, POIColor382);
+            ObjectSetInteger(0, line382, OBJPROP_STYLE, STYLE_SOLID);
+            ObjectSetInteger(0, line382, OBJPROP_WIDTH, 2);
+            ObjectSetString(0, line382, OBJPROP_TEXT, symbol + " POI 38.2%");
+            ObjectSetInteger(0, line382, OBJPROP_BACK, true);
+        }
+    }
+    
+    // POI 50%
+    string line500 = "POI500_" + symbol;
+    if(ObjectFind(0, line500) >= 0) ObjectDelete(0, line500);
+    
+    if(g_symbols[index].poi500 > 0)
+    {
+        if(ObjectCreate(0, line500, OBJ_HLINE, 0, 0, g_symbols[index].poi500))
+        {
+            ObjectSetInteger(0, line500, OBJPROP_COLOR, POIColor500);
+            ObjectSetInteger(0, line500, OBJPROP_STYLE, STYLE_SOLID);
+            ObjectSetInteger(0, line500, OBJPROP_WIDTH, 3);
+            ObjectSetString(0, line500, OBJPROP_TEXT, symbol + " POI 50%");
+            ObjectSetInteger(0, line500, OBJPROP_BACK, true);
+        }
+    }
+    
+    // POI 61.8%
+    string line618 = "POI618_" + symbol;
+    if(ObjectFind(0, line618) >= 0) ObjectDelete(0, line618);
+    
+    if(g_symbols[index].poi618 > 0)
+    {
+        if(ObjectCreate(0, line618, OBJ_HLINE, 0, 0, g_symbols[index].poi618))
+        {
+            ObjectSetInteger(0, line618, OBJPROP_COLOR, POIColor618);
+            ObjectSetInteger(0, line618, OBJPROP_STYLE, STYLE_SOLID);
+            ObjectSetInteger(0, line618, OBJPROP_WIDTH, 2);
+            ObjectSetString(0, line618, OBJPROP_TEXT, symbol + " POI 61.8%");
+            ObjectSetInteger(0, line618, OBJPROP_BACK, true);
+        }
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Draw Fibonacci                                                    |
+//+------------------------------------------------------------------+
+void DrawFibonacciRetracement(int index)
+{
+    if(!IsValidIndex(index)) return;
+    
+    int libIndex = g_symbols[index].libraryIndex;
+    if(libIndex < 0 || libIndex >= MAX_SYMBOLS) return;
+    
+    string symbol = g_symbols[index].symbol;
+    FibonacciData fibData = g_symbolData[libIndex].fibData;
+    
+    if(!fibData.isValid) return;
+    
+    DrawPolishedFibonacci(symbol, fibData, 0);
+}
+
+//+------------------------------------------------------------------+
+//| Draw Trading Zone                                                 |
+//+------------------------------------------------------------------+
+void DrawTradingZone(int index)
+{
+    if(!IsValidIndex(index)) return;
+    
+    string symbol = g_symbols[index].symbol;
+    double poi = g_symbols[index].poi500;
+    int libIndex = g_symbols[index].libraryIndex;
+    
+    string zoneName = "Zone_" + symbol;
+    
+    if(ObjectFind(0, zoneName) >= 0)
+        ObjectDelete(0, zoneName);
+    
+    if(poi <= 0 || libIndex < 0 || libIndex >= MAX_SYMBOLS) return;
+    
+    double atr = g_symbolData[libIndex].momentum;
+    if(atr <= 0) return;
+    
+    double zoneWidth = atr * 0.25;
+    double topPrice = poi + zoneWidth;
+    double bottomPrice = poi - zoneWidth;
+    
+    datetime startTime = iTime(symbol, TimeFrame, 20);
+    datetime endTime = startTime + PeriodSeconds(TimeFrame) * 40;
+    
+    if(ObjectCreate(0, zoneName, OBJ_RECTANGLE, 0, startTime, topPrice, endTime, bottomPrice))
+    {
+        ObjectSetInteger(0, zoneName, OBJPROP_COLOR, ZoneColor);
+        ObjectSetInteger(0, zoneName, OBJPROP_FILL, true);
+        ObjectSetInteger(0, zoneName, OBJPROP_BACK, true);
+        ObjectSetInteger(0, zoneName, OBJPROP_WIDTH, 1);
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Get Trading Signal with Rejection Pattern                        |
+//+------------------------------------------------------------------+
+int GetTradingSignal(int index)
+{
+    if(!IsValidIndex(index)) return 0;
+    
+    string symbol = g_symbols[index].symbol;
+    int libIndex = g_symbols[index].libraryIndex;
+    
+    if(libIndex < 0 || libIndex >= MAX_SYMBOLS) return 0;
+    
+    FibonacciData fibData = g_symbolData[libIndex].fibData;
+    if(!fibData.isValid) return 0;
+    
+    double bid = SymbolInfoDouble(symbol, SYMBOL_BID);
+    double ask = SymbolInfoDouble(symbol, SYMBOL_ASK);
+    double currentPrice = (bid + ask) / 2.0;
+    
+    // Check if price near ANY of the 3 POI levels
+    bool nearPOI = false;
+    double activePOI = 0.0;
+    
+    if(IsPriceNearLevel(symbol, g_symbols[index].poi382, POITolerance))
+    {
+        nearPOI = true;
+        activePOI = g_symbols[index].poi382;
+    }
+    else if(IsPriceNearLevel(symbol, g_symbols[index].poi500, POITolerance))
+    {
+        nearPOI = true;
+        activePOI = g_symbols[index].poi500;
+    }
+    else if(IsPriceNearLevel(symbol, g_symbols[index].poi618, POITolerance))
+    {
+        nearPOI = true;
+        activePOI = g_symbols[index].poi618;
+    }
+    
+    if(!nearPOI) return 0;
+    
+    // Check for rejection pattern (REQUIRED by default)
+    if(RequireRejectionPattern)
+    {
+        RejectionSignal rejection = PricePosition(symbol, activePOI, PatternTimeframe);
+        
+        if(fibData.isBullishTrend && rejection.isBullishRejection)
+        {
+            PrintFormat("✅ %s: BUY SIGNAL - Bullish Fib + %s at POI %.5f", 
+                       symbol, rejection.rejectionType, activePOI);
+            return 1;
+        }
+        
+        if(fibData.isBearishTrend && rejection.isBearishRejection)
+        {
+            PrintFormat("✅ %s: SELL SIGNAL - Bearish Fib + %s at POI %.5f", 
+                       symbol, rejection.rejectionType, activePOI);
+            return -1;
+        }
+        
+        return 0;
+    }
+    
+    // No rejection required (if user disabled it)
+    if(fibData.isBullishTrend)
+    {
+        PrintFormat("✅ %s: BUY SIGNAL - Bullish Fib at POI %.5f", symbol, activePOI);
+        return 1;
+    }
+    
+    if(fibData.isBearishTrend)
+    {
+        PrintFormat("✅ %s: SELL SIGNAL - Bearish Fib at POI %.5f", symbol, activePOI);
+        return -1;
+    }
+    
+    return 0;
+}
+
+//+------------------------------------------------------------------+
+//| Check Trade Cooldown                                             |
+//+------------------------------------------------------------------+
+bool CheckTradeCooldown(int index)
+{
+    if(!IsValidIndex(index)) return false;
+    
+    if(g_symbols[index].lastTradeTime == 0) return true;
+    
+    datetime timeSinceLast = TimeCurrent() - g_symbols[index].lastTradeTime;
+    int cooldownSeconds = MinutesBetweenTrades * 60;
+    
+    return (timeSinceLast >= cooldownSeconds);
+}
+
+//+------------------------------------------------------------------+
+//| Get Deinitialization Reason                                      |
+//+------------------------------------------------------------------+
+string GetDeinitReasonText(int reason)
+{
+    switch(reason)
+    {
+        case REASON_REMOVE:      return "EA removed";
+        case REASON_RECOMPILE:   return "EA recompiled";
+        case REASON_CHARTCHANGE: return "Chart changed";
+        case REASON_CHARTCLOSE:  return "Chart closed";
+        case REASON_PARAMETERS:  return "Parameters changed";
+        case REASON_ACCOUNT:     return "Account changed";
+        case REASON_TEMPLATE:    return "Template applied";
+        case REASON_INITFAILED:  return "Initialization failed";
+        case REASON_CLOSE:       return "Terminal closed";
+        default:                 return "Unknown reason";
+    }
+}
+//+------------------------------------------------------------------+
