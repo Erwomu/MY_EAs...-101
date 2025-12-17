@@ -1,0 +1,224 @@
+//+------------------------------------------------------------------+
+//| REPLACE IN PriceAction.mqh - SIMPLE APPROACH                     |
+//| Highest/Lowest in X bars = Swing High/Low                        |
+//+------------------------------------------------------------------+
+
+//+------------------------------------------------------------------+
+//| Calculate Fibonacci - SIMPLE & EFFECTIVE                         |
+//+------------------------------------------------------------------+
+FibonacciData CalculatePolishedFibonacci(const string symbol,
+                                         ENUM_TIMEFRAMES timeframe = PERIOD_H4,
+                                         int swingLookback = 65,       // Simple: look back X bars
+                                         int confirmBars = 2,          // Not used but kept for compatibility
+                                         int maxSwingAge = 100,        // Not used but kept for compatibility
+                                         double minRangeATR = 0.5)     // Keep for minimum range check
+{
+    FibonacciData fib;
+    fib.Reset();
+    
+    // Get price data
+    double high[];
+    double low[];
+    double close[];
+    datetime time[];
+    
+    int barsNeeded = swingLookback + 5;
+    
+    ArraySetAsSeries(high, true);
+    ArraySetAsSeries(low, true);
+    ArraySetAsSeries(close, true);
+    ArraySetAsSeries(time, true);
+    
+    if(CopyHigh(symbol, timeframe, 0, barsNeeded, high) < barsNeeded)
+    {
+        fib.invalidReason = "Failed to copy high data";
+        Print("ERROR: ", fib.invalidReason, " for ", symbol);
+        return fib;
+    }
+    
+    if(CopyLow(symbol, timeframe, 0, barsNeeded, low) < barsNeeded)
+    {
+        fib.invalidReason = "Failed to copy low data";
+        Print("ERROR: ", fib.invalidReason, " for ", symbol);
+        return fib;
+    }
+    
+    if(CopyClose(symbol, timeframe, 0, 1, close) < 1)
+    {
+        fib.invalidReason = "Failed to copy close data";
+        Print("ERROR: ", fib.invalidReason, " for ", symbol);
+        return fib;
+    }
+    
+    if(CopyTime(symbol, timeframe, 0, barsNeeded, time) < barsNeeded)
+    {
+        fib.invalidReason = "Failed to copy time data";
+        Print("ERROR: ", fib.invalidReason, " for ", symbol);
+        return fib;
+    }
+    
+    fib.currentPrice = close[0];
+    
+    // SIMPLE: Find highest high in lookback period
+    int highestBar = iHighest(symbol, timeframe, MODE_HIGH, swingLookback, 1);
+    if(highestBar < 0)
+    {
+        fib.invalidReason = "Failed to find highest bar";
+        Print("ERROR: ", fib.invalidReason, " for ", symbol);
+        return fib;
+    }
+    
+    // SIMPLE: Find lowest low in lookback period
+    int lowestBar = iLowest(symbol, timeframe, MODE_LOW, swingLookback, 1);
+    if(lowestBar < 0)
+    {
+        fib.invalidReason = "Failed to find lowest bar";
+        Print("ERROR: ", fib.invalidReason, " for ", symbol);
+        return fib;
+    }
+    
+    // Set swing high
+    fib.swingHigh.price = iHigh(symbol, timeframe, highestBar);
+    fib.swingHigh.time = iTime(symbol, timeframe, highestBar);
+    fib.swingHigh.barIndex = highestBar;
+    fib.swingHigh.barsAgo = highestBar;
+    fib.swingHigh.isHigh = true;
+    
+    // Set swing low
+    fib.swingLow.price = iLow(symbol, timeframe, lowestBar);
+    fib.swingLow.time = iTime(symbol, timeframe, lowestBar);
+    fib.swingLow.barIndex = lowestBar;
+    fib.swingLow.barsAgo = lowestBar;
+    fib.swingLow.isHigh = false;
+    
+    // Calculate range
+    fib.range = fib.swingHigh.price - fib.swingLow.price;
+    
+    if(fib.range <= 0)
+    {
+        fib.invalidReason = StringFormat("Invalid range: %.5f (High: %.5f, Low: %.5f)",
+                                        fib.range, fib.swingHigh.price, fib.swingLow.price);
+        Print("ERROR: ", fib.invalidReason, " for ", symbol);
+        return fib;
+    }
+    
+    // Calculate swing distance
+    fib.swingDistance = MathAbs(highestBar - lowestBar);
+    
+    // Determine trend direction
+    // If low came BEFORE high (low has higher bar index) = Bullish
+    // If high came BEFORE low (high has higher bar index) = Bearish
+    fib.isBullishTrend = (lowestBar > highestBar);
+    fib.isBearishTrend = !fib.isBullishTrend;
+    
+    // Get ATR for range validation
+    int atrHandle = iATR(symbol, timeframe, 14);
+    if(atrHandle == INVALID_HANDLE)
+    {
+        fib.invalidReason = "Failed to create ATR indicator";
+        Print("ERROR: ", fib.invalidReason, " for ", symbol);
+        return fib;
+    }
+    
+    double atrBuffer[];
+    if(CopyBuffer(atrHandle, 0, 0, 1, atrBuffer) <= 0)
+    {
+        fib.invalidReason = "Failed to copy ATR buffer";
+        IndicatorRelease(atrHandle);
+        Print("ERROR: ", fib.invalidReason, " for ", symbol);
+        return fib;
+    }
+    
+    double atr = atrBuffer[0];
+    IndicatorRelease(atrHandle);
+    
+    if(atr <= 0)
+    {
+        fib.invalidReason = "Invalid ATR value";
+        Print("ERROR: ", fib.invalidReason, " for ", symbol);
+        return fib;
+    }
+    
+    fib.rangeInATR = fib.range / atr;
+    
+    // Validate range is meaningful (at least 0.5 ATR)
+    if(fib.rangeInATR < minRangeATR)
+    {
+        fib.invalidReason = StringFormat("Range too small: %.2f ATR (min: %.2f)",
+                                        fib.rangeInATR, minRangeATR);
+        LogDebug(StringFormat("%s: %s", symbol, fib.invalidReason));
+        return fib;
+    }
+    
+    // Mark as recent (always true since we're using recent bars)
+    fib.isRecent = true;
+    
+    // Calculate Fibonacci levels based on trend
+    if(fib.isBullishTrend)
+    {
+        // Bullish: retracing down from swing high
+        fib.fib236 = fib.swingHigh.price - (fib.range * 0.236);
+        fib.fib382 = fib.swingHigh.price - (fib.range * 0.382);
+        fib.fib500 = fib.swingHigh.price - (fib.range * 0.500);
+        fib.fib618 = fib.swingHigh.price - (fib.range * 0.618);
+        fib.fib786 = fib.swingHigh.price - (fib.range * 0.786);
+        
+        fib.extension1272 = fib.swingHigh.price + (fib.range * 0.272);
+        fib.extension1618 = fib.swingHigh.price + (fib.range * 0.618);
+        fib.extension2000 = fib.swingHigh.price + fib.range;
+    }
+    else
+    {
+        // Bearish: retracing up from swing low
+        fib.fib236 = fib.swingLow.price + (fib.range * 0.236);
+        fib.fib382 = fib.swingLow.price + (fib.range * 0.382);
+        fib.fib500 = fib.swingLow.price + (fib.range * 0.500);
+        fib.fib618 = fib.swingLow.price + (fib.range * 0.618);
+        fib.fib786 = fib.swingLow.price + (fib.range * 0.786);
+        
+        fib.extension1272 = fib.swingLow.price - (fib.range * 0.272);
+        fib.extension1618 = fib.swingLow.price - (fib.range * 0.618);
+        fib.extension2000 = fib.swingLow.price - fib.range;
+    }
+    
+    // Find nearest Fib level to current price
+    fib.nearestFibLevel = FindNearestFibLevel(fib.currentPrice, fib, fib.distanceToFib);
+    fib.distanceToFib = fib.distanceToFib / atr;
+    
+    // Mark as VALID
+    fib.isValid = true;
+    
+    // Store all swings for compatibility (just put the one swing in array)
+    ArrayResize(fib.allSwingHighs, 1);
+    fib.allSwingHighs[0] = fib.swingHigh;
+    
+    ArrayResize(fib.allSwingLows, 1);
+    fib.allSwingLows[0] = fib.swingLow;
+    
+    // Log success
+    PrintFormat("✅ %s Fibonacci VALID", symbol);
+    PrintFormat("   Lookback: %d bars | Range: %.5f (%.2f ATR)", 
+               swingLookback, fib.range, fib.rangeInATR);
+    PrintFormat("   Swing High: %.5f at bar %d (%s)",
+               fib.swingHigh.price, highestBar, TimeToString(fib.swingHigh.time));
+    PrintFormat("   Swing Low: %.5f at bar %d (%s)",
+               fib.swingLow.price, lowestBar, TimeToString(fib.swingLow.time));
+    PrintFormat("   Trend: %s (Low bar %d → High bar %d)",
+               fib.isBullishTrend ? "BULLISH" : "BEARISH",
+               lowestBar, highestBar);
+    PrintFormat("   Current: %.5f | Distance: %d bars | POIs: 38.2%%: %.5f | 50%%: %.5f | 61.8%%: %.5f",
+               fib.currentPrice, fib.swingDistance,
+               fib.fib382, fib.fib500, fib.fib618);
+    
+    return fib;
+}
+
+//+------------------------------------------------------------------+
+//| REMOVE/COMMENT OUT - No longer needed                            |
+//+------------------------------------------------------------------+
+// You can delete or comment out these functions as they're no longer used:
+// - FindAllSwingHighs()
+// - FindAllSwingLows() 
+// - FindBestSwingPair()
+// 
+// The new CalculatePolishedFibonacci() does everything internally
