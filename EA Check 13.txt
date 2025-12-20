@@ -1,0 +1,895 @@
+//+------------------------------------------------------------------+
+//|                                              L'ACTION DE PRIX.mq5 |
+//|                                  Copyright 2025, MetaQuotes Ltd. |
+//|                                             https://www.mql5.com |
+//+------------------------------------------------------------------+
+#property copyright "Copyright 2025, MetaQuotes Ltd."
+#property link      "https://www.mql5.com"
+#property version   "12.00"
+#property description "V12.0: ADX FILTER + MULTI-TIMEFRAME ALIGNMENT"
+#property description "FibRange: 40 bars | RR: 3:1 | BE: 1.0x | Trail: 1.5x"
+#property description "ADX: Min 25 | MTF: 3 Timeframes Aligned"
+#property description "100% Production Ready"
+
+//+------------------------------------------------------------------+
+//| Include Directives                                               |
+//+------------------------------------------------------------------+
+#include <Trade\Trade.mqh>
+#include <Trade\SymbolInfo.mqh>
+#include <Trade\PositionInfo.mqh>
+#include <PriceAction.mqh>
+
+//+------------------------------------------------------------------+
+//| EA Input Parameters                                              |
+//+------------------------------------------------------------------+
+sinput string            SEP1                = "=== Position Limits ===";
+input int                MaxPositionsPerSymbol = 1;
+input int                MaxTotalPositions  = 3;
+
+sinput string            SEP2                = "=== Trading Filters ===";
+input bool               RequireRejectionPattern = true;
+input double             POITolerance       = 20.0;
+
+sinput string            SEP3                = "=== ADX Filter ===";
+input bool               UseADXFilter       = true;
+input int                ADXPeriod          = 14;
+input double             MinADX             = 25.0;
+input ENUM_TIMEFRAMES    ADXTimeframe       = PERIOD_H4;
+
+sinput string            SEP4                = "=== Multi-Timeframe Alignment ===";
+input bool               UseMTFAlignment    = true;
+input ENUM_TIMEFRAMES    HigherTimeframe    = PERIOD_D1;
+input ENUM_TIMEFRAMES    LowerTimeframe     = PERIOD_H1;
+
+sinput string            SEP5                = "=== Trading Cooldown ===";
+input int                MinutesBetweenTrades = 120;
+
+sinput string            SEP6                = "=== Visualization ===";
+input bool               DrawFibonacci      = true;
+input bool               DrawZones          = true;
+input color              ZoneColor          = clrDarkSlateGray;
+input color              POIColor382        = clrGold;
+input color              POIColor500        = clrOrange;
+input color              POIColor618        = clrCrimson;
+
+//+------------------------------------------------------------------+
+//| Symbol Configuration                                              |
+//+------------------------------------------------------------------+
+struct SymbolConfig
+{
+    string   symbol;
+    double   multiplier;
+    double   maxSpread;
+    bool     isActive;
+    
+    double   poi382;
+    double   poi500;
+    double   poi618;
+    
+    bool     hasPosition;
+    datetime lastTradeTime;
+    datetime lastBarProcessed;
+    
+    int      libraryIndex;
+    int      adxHandle;
+};
+
+//+------------------------------------------------------------------+
+//| Global Variables                                                  |
+//+------------------------------------------------------------------+
+SymbolConfig    g_symbols[];
+int             g_eaSymbolCount = 0;
+CPositionInfo   g_positionInfo;
+int             g_totalPositions = 0;
+bool            g_isFullyInitialized = false;
+bool            g_initializationFailed = false;
+
+//+------------------------------------------------------------------+
+//| Validate Index                                                    |
+//+------------------------------------------------------------------+
+bool IsValidIndex(int index)
+{
+    return (index >= 0 && index < ArraySize(g_symbols) && index < g_eaSymbolCount);
+}
+
+//+------------------------------------------------------------------+
+//| Initialize ADX Handles                                            |
+//+------------------------------------------------------------------+
+bool InitializeADXHandles()
+{
+    if(!UseADXFilter)
+    {
+        Print("ADX Filter: DISABLED");
+        return true;
+    }
+    
+    Print("========================================");
+    Print("ADX Filter: ENABLED");
+    PrintFormat("  Period: %d | Min ADX: %.1f", ADXPeriod, MinADX);
+    PrintFormat("  Timeframe: %s", EnumToString(ADXTimeframe));
+    Print("========================================");
+    
+    int created = 0;
+    for(int i = 0; i < g_eaSymbolCount; i++)
+    {
+        if(!IsValidIndex(i) || !g_symbols[i].isActive) continue;
+        
+        string symbol = g_symbols[i].symbol;
+        
+        int bars = Bars(symbol, ADXTimeframe);
+        if(bars < ADXPeriod + 10)
+        {
+            iTime(symbol, ADXTimeframe, ADXPeriod + 20);
+            Sleep(100);
+        }
+        
+        int handle = iADX(symbol, ADXTimeframe, ADXPeriod);
+        
+        if(handle == INVALID_HANDLE)
+        {
+            PrintFormat("⚠️ %s: Failed to create ADX handle", symbol);
+            g_symbols[i].adxHandle = INVALID_HANDLE;
+            continue;
+        }
+        
+        double testBuffer[1];
+        if(CopyBuffer(handle, 0, 0, 1, testBuffer) > 0)
+        {
+            g_symbols[i].adxHandle = handle;
+            created++;
+            PrintFormat("  ✓ %s: ADX handle created (%.2f)", symbol, testBuffer[0]);
+        }
+        else
+        {
+            PrintFormat("⚠️ %s: ADX handle created but data not ready", symbol);
+            g_symbols[i].adxHandle = handle;
+        }
+    }
+    
+    PrintFormat("✓ ADX handles created: %d/%d", created, g_eaSymbolCount);
+    return true;
+}
+
+//+------------------------------------------------------------------+
+//| Release ADX Handles                                               |
+//+------------------------------------------------------------------+
+void ReleaseADXHandles()
+{
+    if(!UseADXFilter) return;
+    
+    int released = 0;
+    for(int i = 0; i < g_eaSymbolCount; i++)
+    {
+        if(IsValidIndex(i) && g_symbols[i].adxHandle != INVALID_HANDLE)
+        {
+            IndicatorRelease(g_symbols[i].adxHandle);
+            g_symbols[i].adxHandle = INVALID_HANDLE;
+            released++;
+        }
+    }
+    
+    if(released > 0)
+        PrintFormat("Released %d ADX handles", released);
+}
+
+//+------------------------------------------------------------------+
+//| Check ADX Trend Strength                                          |
+//+------------------------------------------------------------------+
+bool CheckADXTrendStrength(int index, bool isBullish)
+{
+    if(!UseADXFilter) return true;
+    
+    if(!IsValidIndex(index)) return false;
+    
+    if(g_symbols[index].adxHandle == INVALID_HANDLE)
+        return true; // Allow trade if ADX not available
+    
+    double adxMain[], plusDI[], minusDI[];
+    
+    if(CopyBuffer(g_symbols[index].adxHandle, 0, 0, 3, adxMain) < 3 ||
+       CopyBuffer(g_symbols[index].adxHandle, 1, 0, 3, plusDI) < 3 ||
+       CopyBuffer(g_symbols[index].adxHandle, 2, 0, 3, minusDI) < 3)
+    {
+        return true; // Allow trade if data copy fails
+    }
+    
+    double currentADX = adxMain[0];
+    double currentPlusDI = plusDI[0];
+    double currentMinusDI = minusDI[0];
+    
+    if(currentADX < MinADX)
+    {
+        PrintFormat("❌ %s: ADX too weak (%.2f < %.2f)", 
+                   g_symbols[index].symbol, currentADX, MinADX);
+        return false;
+    }
+    
+    if(isBullish)
+    {
+        if(currentPlusDI <= currentMinusDI)
+        {
+            PrintFormat("❌ %s: ADX bullish but +DI(%.2f) <= -DI(%.2f)", 
+                       g_symbols[index].symbol, currentPlusDI, currentMinusDI);
+            return false;
+        }
+        
+        PrintFormat("✓ %s: ADX STRONG BULLISH | ADX: %.2f | +DI: %.2f > -DI: %.2f", 
+                   g_symbols[index].symbol, currentADX, currentPlusDI, currentMinusDI);
+    }
+    else
+    {
+        if(currentMinusDI <= currentPlusDI)
+        {
+            PrintFormat("❌ %s: ADX bearish but -DI(%.2f) <= +DI(%.2f)", 
+                       g_symbols[index].symbol, currentMinusDI, currentPlusDI);
+            return false;
+        }
+        
+        PrintFormat("✓ %s: ADX STRONG BEARISH | ADX: %.2f | -DI: %.2f > +DI: %.2f", 
+                   g_symbols[index].symbol, currentADX, currentMinusDI, currentPlusDI);
+    }
+    
+    return true;
+}
+
+//+------------------------------------------------------------------+
+//| Check Multi-Timeframe Alignment                                   |
+//+------------------------------------------------------------------+
+bool CheckMTFAlignment(int index, bool isBullish)
+{
+    if(!UseMTFAlignment) return true;
+    
+    if(!IsValidIndex(index)) return false;
+    
+    string symbol = g_symbols[index].symbol;
+    
+    FibonacciData higherTFFib = CalculatePolishedFibonacci(symbol, HigherTimeframe, 40, 2, 100, 0.5);
+    FibonacciData lowerTFFib = CalculatePolishedFibonacci(symbol, LowerTimeframe, 40, 2, 100, 0.5);
+    
+    if(!higherTFFib.isValid)
+    {
+        PrintFormat("⚠️ %s: Higher TF (%s) Fib invalid - allowing trade", 
+                   symbol, EnumToString(HigherTimeframe));
+        return true;
+    }
+    
+    if(!lowerTFFib.isValid)
+    {
+        PrintFormat("⚠️ %s: Lower TF (%s) Fib invalid - allowing trade", 
+                   symbol, EnumToString(LowerTimeframe));
+        return true;
+    }
+    
+    if(isBullish)
+    {
+        if(!higherTFFib.isBullishTrend)
+        {
+            PrintFormat("❌ %s: MTF CONFLICT - Higher TF (%s) is NOT BULLISH", 
+                       symbol, EnumToString(HigherTimeframe));
+            return false;
+        }
+        
+        if(!lowerTFFib.isBullishTrend)
+        {
+            PrintFormat("❌ %s: MTF CONFLICT - Lower TF (%s) is NOT BULLISH", 
+                       symbol, EnumToString(LowerTimeframe));
+            return false;
+        }
+        
+        PrintFormat("✓ %s: MTF ALIGNED BULLISH | %s: ✓ | %s: ✓ | %s: ✓", 
+                   symbol, 
+                   EnumToString(HigherTimeframe),
+                   EnumToString(TimeFrame),
+                   EnumToString(LowerTimeframe));
+    }
+    else
+    {
+        if(!higherTFFib.isBearishTrend)
+        {
+            PrintFormat("❌ %s: MTF CONFLICT - Higher TF (%s) is NOT BEARISH", 
+                       symbol, EnumToString(HigherTimeframe));
+            return false;
+        }
+        
+        if(!lowerTFFib.isBearishTrend)
+        {
+            PrintFormat("❌ %s: MTF CONFLICT - Lower TF (%s) is NOT BEARISH", 
+                       symbol, EnumToString(LowerTimeframe));
+            return false;
+        }
+        
+        PrintFormat("✓ %s: MTF ALIGNED BEARISH | %s: ✓ | %s: ✓ | %s: ✓", 
+                   symbol, 
+                   EnumToString(HigherTimeframe),
+                   EnumToString(TimeFrame),
+                   EnumToString(LowerTimeframe));
+    }
+    
+    return true;
+}
+
+//+------------------------------------------------------------------+
+//| OnInit                                                            |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+    g_eaSymbolCount = 0;
+    g_isFullyInitialized = false;
+    g_initializationFailed = false;
+    g_totalPositions = 0;
+    
+    ArrayResize(g_symbols, 0);
+    
+    Print("========================================");
+    Print("L'ACTION DE PRIX EA V12.0");
+    Print("ADX FILTER + MTF ALIGNMENT");
+    Print("========================================");
+    
+    if(!InitializePriceAction())
+    {
+        Print("❌ Library init failed");
+        g_initializationFailed = true;
+        return INIT_FAILED;
+    }
+    
+    if(!ConfigureSymbols())
+    {
+        Print("❌ Config failed");
+        g_initializationFailed = true;
+        return INIT_FAILED;
+    }
+    
+    for(int i = 0; i < g_eaSymbolCount; i++)
+    {
+        if(!IsValidIndex(i)) continue;
+        
+        string symbol = g_symbols[i].symbol;
+        SymbolSelect(symbol, true);
+        
+        for(int retry = 0; retry < 3; retry++)
+        {
+            int bars = Bars(symbol, ATRTimeframe);
+            if(bars >= ATRPeriod + 10) break;
+            
+            iTime(symbol, ATRTimeframe, ATRPeriod + 20);
+            Sleep(300);
+        }
+    }
+    Sleep(500);
+    
+    int activeCount = 0;
+    for(int i = 0; i < g_eaSymbolCount; i++)
+    {
+        if(!IsValidIndex(i)) continue;
+        
+        if(InitializeSymbol(g_symbols[i].symbol, g_symbols[i].multiplier, g_symbols[i].maxSpread))
+        {
+            g_symbols[i].libraryIndex = GetSymbolIndex(g_symbols[i].symbol);
+            g_symbols[i].isActive = (g_symbols[i].libraryIndex >= 0);
+            
+            if(g_symbols[i].isActive)
+            {
+                activeCount++;
+                PrintFormat("  ✓ %s -> Lib[%d]", g_symbols[i].symbol, g_symbols[i].libraryIndex);
+            }
+        }
+    }
+    
+    if(activeCount == 0)
+    {
+        Print("❌ No active symbols");
+        g_initializationFailed = true;
+        return INIT_FAILED;
+    }
+    
+    Sleep(1000);
+    InitializeATRHandles();
+    
+    for(int i = 0; i < g_eaSymbolCount; i++)
+    {
+        if(!IsValidIndex(i)) continue;
+        if(!g_symbols[i].isActive) continue;
+        
+        int libIndex = g_symbols[i].libraryIndex;
+        if(libIndex >= 0 && libIndex < MAX_SYMBOLS)
+        {
+            GetOrCreateATRHandle(g_symbols[i].symbol, libIndex);
+        }
+    }
+    
+    InitializeADXHandles();
+    
+    g_trade.SetExpertMagicNumber(123456);
+    g_trade.SetDeviationInPoints(10);
+    g_trade.SetTypeFilling(ORDER_FILLING_IOC);
+    
+    g_isFullyInitialized = true;
+    
+    Print("========================================");
+    Print("✅ EA READY TO TRADE - V12.0 ENHANCED");
+    Print("========================================");
+    PrintFormat("  Symbols: %d active", activeCount);
+    PrintFormat("  Swing Detection: 40 bars (responsive)");
+    PrintFormat("  POI Levels: 3 (38.2%%, 50%%, 61.8%%)");
+    PrintFormat("  RR Target: 3:1 (optimized)");
+    PrintFormat("  BE Protection: 1.0x SL (faster)");
+    PrintFormat("  First Trail: 1.5x SL (tighter)");
+    PrintFormat("  Patterns: %s", RequireRejectionPattern ? "REQUIRED (STRICT)" : "Optional");
+    PrintFormat("  ADX Filter: %s (Min: %.1f)", UseADXFilter ? "ENABLED" : "DISABLED", MinADX);
+    PrintFormat("  MTF Alignment: %s", UseMTFAlignment ? "ENABLED" : "DISABLED");
+    if(UseMTFAlignment)
+    {
+        PrintFormat("    Higher TF: %s", EnumToString(HigherTimeframe));
+        PrintFormat("    Main TF: %s", EnumToString(TimeFrame));
+        PrintFormat("    Lower TF: %s", EnumToString(LowerTimeframe));
+    }
+    PrintFormat("  Cooldown: %d minutes (%.1f hours)", MinutesBetweenTrades, MinutesBetweenTrades/60.0);
+    PrintFormat("  Max Positions: %d per symbol | %d total", MaxPositionsPerSymbol, MaxTotalPositions);
+    Print("========================================");
+    
+    return INIT_SUCCEEDED;
+}
+
+//+------------------------------------------------------------------+
+//| OnDeinit                                                          |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+    g_isFullyInitialized = false;
+    
+    ReleaseADXHandles();
+    
+    for(int i = 0; i < g_eaSymbolCount; i++)
+    {
+        if(IsValidIndex(i))
+        {
+            string symbol = g_symbols[i].symbol;
+            ObjectDelete(0, "POI382_" + symbol);
+            ObjectDelete(0, "POI500_" + symbol);
+            ObjectDelete(0, "POI618_" + symbol);
+            ObjectDelete(0, "Zone_" + symbol);
+            
+            string prefix = "Fib_" + symbol + "_";
+            ObjectDelete(0, prefix + "Main");
+            ObjectDelete(0, prefix + "HighMarker");
+            ObjectDelete(0, prefix + "LowMarker");
+        }
+    }
+    
+    ReleaseATRHandles();
+    DeinitializePriceAction();
+    
+    g_eaSymbolCount = 0;
+    ArrayResize(g_symbols, 0);
+    
+    PrintFormat("EA Deinitialized: %s", GetDeinitReasonText(reason));
+}
+
+//+------------------------------------------------------------------+
+//| OnTick - ALL LOGIC HERE (No OnTimer)                             |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+    if(g_initializationFailed || !g_isFullyInitialized) return;
+    if(g_eaSymbolCount <= 0) return;
+    
+    g_totalPositions = GetActivePositionsCount();
+    
+    CheckNewsImpact();
+    
+    for(int i = 0; i < g_eaSymbolCount; i++)
+    {
+        if(!IsValidIndex(i)) continue;
+        if(!g_symbols[i].isActive) continue;
+        
+        string symbol = g_symbols[i].symbol;
+        
+        datetime currentBarTime = iTime(symbol, PatternTimeframe, 0);
+        
+        if(currentBarTime != g_symbols[i].lastBarProcessed)
+        {
+            g_symbols[i].lastBarProcessed = currentBarTime;
+            
+            ProcessSymbol(symbol);
+            
+            CalculatePOILevels(i);
+            
+            if(DrawFibonacci || DrawZones)
+            {
+                DrawPOILevels(i);
+                
+                if(DrawZones)
+                    DrawTradingZone(i);
+                
+                if(DrawFibonacci)
+                    DrawFibonacciRetracement(i);
+            }
+        }
+        
+        int posCount = GetActivePositionsCount(symbol);
+        g_symbols[i].hasPosition = (posCount >= MaxPositionsPerSymbol);
+        
+        if(g_symbols[i].hasPosition)
+        {
+            ModifyTrade(symbol);
+            continue;
+        }
+        
+        if(g_totalPositions >= MaxTotalPositions)
+            continue;
+        
+        if(!IsTradingAllowed(symbol)) 
+            continue;
+        
+        if(!CheckTradeCooldown(i)) 
+            continue;
+        
+        int signal = GetTradingSignal(i);
+        if(signal == 0) 
+            continue;
+        
+        posCount = GetActivePositionsCount(symbol);
+        if(posCount >= MaxPositionsPerSymbol)
+        {
+            g_symbols[i].hasPosition = true;
+            continue;
+        }
+        
+        if(ExecuteTrade(symbol, signal))
+        {
+            datetime now = TimeCurrent();
+            g_symbols[i].lastTradeTime = now;
+            g_symbols[i].hasPosition = true;
+            
+            g_totalPositions = GetActivePositionsCount();
+            
+            PrintFormat("🎯 TRADE OPENED: %s %s | Next trade: %s", 
+                       symbol, 
+                       (signal == 1 ? "BUY" : "SELL"),
+                       TimeToString(now + (MinutesBetweenTrades * 60), TIME_DATE|TIME_MINUTES));
+        }
+    }
+}
+
+//+------------------------------------------------------------------+
+//| OnTrade                                                           |
+//+------------------------------------------------------------------+
+void OnTrade()
+{
+    if(g_initializationFailed || !g_isFullyInitialized) return;
+    
+    g_totalPositions = GetActivePositionsCount();
+    
+    for(int i = 0; i < g_eaSymbolCount; i++)
+    {
+        if(!IsValidIndex(i)) continue;
+        if(!g_symbols[i].isActive) continue;
+        
+        string symbol = g_symbols[i].symbol;
+        int posCount = GetActivePositionsCount(symbol);
+        
+        bool hadPosition = g_symbols[i].hasPosition;
+        g_symbols[i].hasPosition = (posCount > 0);
+        
+        if(posCount == 0 && hadPosition)
+        {
+            PrintFormat("📊 TRADE CLOSED: %s", symbol);
+        }
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Configure Symbols                                                 |
+//+------------------------------------------------------------------+
+bool ConfigureSymbols()
+{
+    string symbols[] = {"EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD", "NZDUSD"};
+    double multipliers[] = {10000, 10000, 100, 10000, 10000, 10000};
+    double maxSpreads[] = {0.00030, 0.00035, 0.040, 0.00030, 0.00030, 0.00040};
+    
+    int count = ArraySize(symbols);
+    if(count == 0) return false;
+    
+    if(ArrayResize(g_symbols, count) != count) return false;
+    
+    g_eaSymbolCount = count;
+    
+    for(int i = 0; i < g_eaSymbolCount; i++)
+    {
+        g_symbols[i].symbol = symbols[i];
+        g_symbols[i].multiplier = multipliers[i];
+        g_symbols[i].maxSpread = maxSpreads[i];
+        g_symbols[i].isActive = false;
+        g_symbols[i].poi382 = 0.0;
+        g_symbols[i].poi500 = 0.0;
+        g_symbols[i].poi618 = 0.0;
+        g_symbols[i].hasPosition = false;
+        g_symbols[i].lastTradeTime = 0;
+        g_symbols[i].lastBarProcessed = 0;
+        g_symbols[i].libraryIndex = -1;
+        g_symbols[i].adxHandle = INVALID_HANDLE;
+    }
+    
+    return true;
+}
+
+//+------------------------------------------------------------------+
+//| Calculate POI Levels                                              |
+//+------------------------------------------------------------------+
+void CalculatePOILevels(int index)
+{
+    if(!IsValidIndex(index)) return;
+    
+    int libIndex = g_symbols[index].libraryIndex;
+    
+    if(libIndex < 0 || libIndex >= MAX_SYMBOLS)
+    {
+        g_symbols[index].poi382 = 0.0;
+        g_symbols[index].poi500 = 0.0;
+        g_symbols[index].poi618 = 0.0;
+        return;
+    }
+    
+    FibonacciData fibData = g_symbolData[libIndex].fibData;
+    
+    if(!fibData.isValid)
+    {
+        g_symbols[index].poi382 = 0.0;
+        g_symbols[index].poi500 = 0.0;
+        g_symbols[index].poi618 = 0.0;
+        return;
+    }
+    
+    g_symbols[index].poi382 = fibData.fib382;
+    g_symbols[index].poi500 = fibData.fib500;
+    g_symbols[index].poi618 = fibData.fib618;
+}
+
+//+------------------------------------------------------------------+
+//| Draw POI Levels                                                   |
+//+------------------------------------------------------------------+
+void DrawPOILevels(int index)
+{
+    if(!IsValidIndex(index)) return;
+    
+    string symbol = g_symbols[index].symbol;
+    
+    string line382 = "POI382_" + symbol;
+    if(ObjectFind(0, line382) >= 0) ObjectDelete(0, line382);
+    
+    if(g_symbols[index].poi382 > 0)
+    {
+        if(ObjectCreate(0, line382, OBJ_HLINE, 0, 0, g_symbols[index].poi382))
+        {
+            ObjectSetInteger(0, line382, OBJPROP_COLOR, POIColor382);
+            ObjectSetInteger(0, line382, OBJPROP_STYLE, STYLE_SOLID);
+            ObjectSetInteger(0, line382, OBJPROP_WIDTH, 2);
+            ObjectSetString(0, line382, OBJPROP_TEXT, symbol + " POI 38.2%");
+            ObjectSetInteger(0, line382, OBJPROP_BACK, true);
+        }
+    }
+    
+    string line500 = "POI500_" + symbol;
+    if(ObjectFind(0, line500) >= 0) ObjectDelete(0, line500);
+    
+    if(g_symbols[index].poi500 > 0)
+    {
+        if(ObjectCreate(0, line500, OBJ_HLINE, 0, 0, g_symbols[index].poi500))
+        {
+            ObjectSetInteger(0, line500, OBJPROP_COLOR, POIColor500);
+            ObjectSetInteger(0, line500, OBJPROP_STYLE, STYLE_SOLID);
+            ObjectSetInteger(0, line500, OBJPROP_WIDTH, 3);
+            ObjectSetString(0, line500, OBJPROP_TEXT, symbol + " POI 50%");
+            ObjectSetInteger(0, line500, OBJPROP_BACK, true);
+        }
+    }
+    
+    string line618 = "POI618_" + symbol;
+    if(ObjectFind(0, line618) >= 0) ObjectDelete(0, line618);
+    
+    if(g_symbols[index].poi618 > 0)
+    {
+        if(ObjectCreate(0, line618, OBJ_HLINE, 0, 0, g_symbols[index].poi618))
+        {
+            ObjectSetInteger(0, line618, OBJPROP_COLOR, POIColor618);
+            ObjectSetInteger(0, line618, OBJPROP_STYLE, STYLE_SOLID);
+            ObjectSetInteger(0, line618, OBJPROP_WIDTH, 2);
+            ObjectSetString(0, line618, OBJPROP_TEXT, symbol + " POI 61.8%");
+            ObjectSetInteger(0, line618, OBJPROP_BACK, true);
+        }
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Draw Fibonacci                                                    |
+//+------------------------------------------------------------------+
+void DrawFibonacciRetracement(int index)
+{
+    if(!IsValidIndex(index)) return;
+    
+    int libIndex = g_symbols[index].libraryIndex;
+    if(libIndex < 0 || libIndex >= MAX_SYMBOLS) return;
+    
+    string symbol = g_symbols[index].symbol;
+    FibonacciData fibData = g_symbolData[libIndex].fibData;
+    
+    if(!fibData.isValid) return;
+    
+    DrawPolishedFibonacci(symbol, fibData, 0);
+}
+
+//+------------------------------------------------------------------+
+//| Draw Trading Zone                                                 |
+//+------------------------------------------------------------------+
+void DrawTradingZone(int index)
+{
+    if(!IsValidIndex(index)) return;
+    
+    string symbol = g_symbols[index].symbol;
+    double poi = g_symbols[index].poi500;
+    int libIndex = g_symbols[index].libraryIndex;
+    
+    string zoneName = "Zone_" + symbol;
+    
+    if(ObjectFind(0, zoneName) >= 0)
+        ObjectDelete(0, zoneName);
+    
+    if(poi <= 0 || libIndex < 0 || libIndex >= MAX_SYMBOLS) return;
+    
+    double atr = g_symbolData[libIndex].momentum;
+    if(atr <= 0) return;
+    
+    double zoneWidth = atr * 0.25;
+    double topPrice = poi + zoneWidth;
+    double bottomPrice = poi - zoneWidth;
+    
+    datetime startTime = iTime(symbol, TimeFrame, 20);
+    datetime endTime = startTime + PeriodSeconds(TimeFrame) * 40;
+    
+    if(ObjectCreate(0, zoneName, OBJ_RECTANGLE, 0, startTime, topPrice, endTime, bottomPrice))
+    {
+        ObjectSetInteger(0, zoneName, OBJPROP_COLOR, ZoneColor);
+        ObjectSetInteger(0, zoneName, OBJPROP_FILL, true);
+        ObjectSetInteger(0, zoneName, OBJPROP_BACK, true);
+        ObjectSetInteger(0, zoneName, OBJPROP_WIDTH, 1);
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Get Trading Signal - ENHANCED WITH ADX & MTF                      |
+//+------------------------------------------------------------------+
+int GetTradingSignal(int index)
+{
+    if(!IsValidIndex(index)) return 0;
+    
+    string symbol = g_symbols[index].symbol;
+    int libIndex = g_symbols[index].libraryIndex;
+    
+    if(libIndex < 0 || libIndex >= MAX_SYMBOLS) return 0;
+    
+    FibonacciData fibData = g_symbolData[libIndex].fibData;
+    if(!fibData.isValid) return 0;
+    
+    RejectionSignal rejection = g_symbolData[libIndex].rejectionSignal;
+    
+    double bid = SymbolInfoDouble(symbol, SYMBOL_BID);
+    double ask = SymbolInfoDouble(symbol, SYMBOL_ASK);
+    double currentPrice = (bid + ask) / 2.0;
+    
+    bool nearPOI = false;
+    
+    if(IsPriceNearLevel(symbol, g_symbols[index].poi382, POITolerance) ||
+       IsPriceNearLevel(symbol, g_symbols[index].poi500, POITolerance) ||
+       IsPriceNearLevel(symbol, g_symbols[index].poi618, POITolerance))
+    {
+        nearPOI = true;
+    }
+    
+    if(!nearPOI) return 0;
+    
+    if(RequireRejectionPattern)
+    {
+        if(!rejection.isConfirmed)
+        {
+            return 0;
+        }
+        
+        if(rejection.usedForTrade)
+        {
+            return 0;
+        }
+        
+        if(fibData.isBullishTrend && rejection.isBullishRejection)
+        {
+            if(!CheckADXTrendStrength(index, true))
+                return 0;
+            
+            if(!CheckMTFAlignment(index, true))
+                return 0;
+            
+            PrintFormat("🎯 %s: BUY SIGNAL - %s pattern | ADX: ✓ | MTF: ✓", symbol, rejection.rejectionType);
+            return 1;
+        }
+        
+        if(fibData.isBearishTrend && rejection.isBearishRejection)
+        {
+            if(!CheckADXTrendStrength(index, false))
+                return 0;
+            
+            if(!CheckMTFAlignment(index, false))
+                return 0;
+            
+            PrintFormat("🎯 %s: SELL SIGNAL - %s pattern | ADX: ✓ | MTF: ✓", symbol, rejection.rejectionType);
+            return -1;
+        }
+        
+        return 0;
+    }
+    
+    if(fibData.isBullishTrend)
+    {
+        if(!CheckADXTrendStrength(index, true))
+            return 0;
+        
+        if(!CheckMTFAlignment(index, true))
+            return 0;
+        
+        PrintFormat("🎯 %s: BUY SIGNAL - Bullish Fib | ADX: ✓ | MTF: ✓", symbol);
+        return 1;
+    }
+    
+    if(fibData.isBearishTrend)
+    {
+        if(!CheckADXTrendStrength(index, false))
+            return 0;
+        
+        if(!CheckMTFAlignment(index, false))
+            return 0;
+        
+        PrintFormat("🎯 %s: SELL SIGNAL - Bearish Fib | ADX: ✓ | MTF: ✓", symbol);
+        return -1;
+    }
+    
+    return 0;
+}
+
+//+------------------------------------------------------------------+
+//| Check Trade Cooldown                                              |
+//+------------------------------------------------------------------+
+bool CheckTradeCooldown(int index)
+{
+    if(!IsValidIndex(index)) return false;
+    
+    if(g_symbols[index].lastTradeTime == 0) return true;
+    
+    datetime timeSinceLast = TimeCurrent() - g_symbols[index].lastTradeTime;
+    int cooldownSeconds = MinutesBetweenTrades * 60;
+    
+    if(timeSinceLast < cooldownSeconds)
+    {
+        return false;
+    }
+    
+    return true;
+}
+
+//+------------------------------------------------------------------+
+//| Get Deinit Reason                                                 |
+//+------------------------------------------------------------------+
+string GetDeinitReasonText(int reason)
+{
+    switch(reason)
+    {
+        case REASON_REMOVE:      return "EA removed";
+        case REASON_RECOMPILE:   return "EA recompiled";
+        case REASON_CHARTCHANGE: return "Chart changed";
+        case REASON_CHARTCLOSE:  return "Chart closed";
+        case REASON_PARAMETERS:  return "Parameters changed";
+        case REASON_ACCOUNT:     return "Account changed";
+        case REASON_TEMPLATE:    return "Template applied";
+        case REASON_INITFAILED:  return "Initialization failed";
+        case REASON_CLOSE:       return "Terminal closed";
+        default:                 return "Unknown reason";
+    }
+}
+//+------------------------------------------------------------------+
